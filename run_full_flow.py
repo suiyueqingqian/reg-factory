@@ -5,7 +5,7 @@ run_full_flow.py — 端到端全流程编排（含邮箱注册）
 把项目原有的两个阶段串成一条龙，方便"跑一遍看看"：
 
   Stage A  邮箱注册   outlook_reg_loop.py        -> 产出新 outlook 号写进 emails.txt
-  Stage B  平台注册   register_three_platforms   -> 用该号去 claude/chatgpt/grok 注册
+  Stage B  平台注册   register_three_platforms   -> 每个邮箱只分配一个所选平台
 
 Stage A 本身是个常驻循环，这里把它当子进程拉起、盯着 emails.txt，**一旦冒出
 一个新的可用号就立刻杀掉循环**进入 Stage B，所以是"注册到一个邮箱就往下走"。
@@ -16,6 +16,7 @@ Stage A 本身是个常驻循环，这里把它当子进程拉起、盯着 email
 用法：
   python run_full_flow.py                          # 注册1个邮箱 -> 在 claude 上注册
   python run_full_flow.py --platforms claude chatgpt
+  python run_full_flow.py --rounds 12 --concurrency 3 --platforms claude chatgpt github  # 按邮箱轮询分配
   python run_full_flow.py --platforms chatgpt --rounds 10   # 循环注册 10 个号
   python run_full_flow.py --platforms chatgpt --rounds 0    # 无限循环（Ctrl+C 停）
   python run_full_flow.py --skip-email --email a@outlook.com --password xxx   # 跳过邮箱注册
@@ -25,6 +26,8 @@ Stage A 本身是个常驻循环，这里把它当子进程拉起、盯着 email
 from __future__ import annotations
 
 import argparse
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import subprocess
 import sys
@@ -36,6 +39,68 @@ if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+
+def _terminate_process_tree(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    pid = int(getattr(proc, "pid", 0) or 0)
+    try:
+        if os.name == "nt" and pid > 0:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def _cleanup_active_profiles(owner=None):
+    """Close/delete profiles created by this flow, including API-detached Chrome."""
+    try:
+        from common.browser_registry import active_profiles, unregister
+        from bitbrowser import BitBrowser
+        records = active_profiles(owner=owner)
+    except Exception:
+        return 0
+    cleaned = 0
+    for record in records:
+        profile_id = record.get("id")
+        if not profile_id:
+            continue
+        try:
+            bb = BitBrowser(api_base=record.get("api_base") or None)
+            try:
+                bb.close_browser(profile_id)
+            except Exception:
+                pass
+            try:
+                bb.delete_browser(profile_id)
+            except Exception:
+                pass
+            unregister(profile_id)
+            cleaned += 1
+        except Exception:
+            pass
+    if cleaned:
+        log(f"已回收 {cleaned} 个残留浏览器 profile", "OK")
+    return cleaned
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.environ.get("REG_FACTORY_DATA_DIR", "").strip() or ROOT
@@ -51,6 +116,7 @@ except Exception:
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
 CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
 from common import proxy_switch
+from common.concurrency import build_worker_plan
 
 PROXY_DEFAULT = proxy_switch.effective_proxy_url()
 
@@ -113,21 +179,37 @@ def build_child_env(args):
         no_proxy = "127.0.0.1,localhost,::1"
         env["NO_PROXY"] = env["no_proxy"] = no_proxy
     # 让 outlook_reg_loop 的 _clash_verge 能连控制器换节点
-    env.setdefault("CLASH_API", args.clash_api)
-    env.setdefault("CLASH_SECRET", args.clash_secret)
-    env.setdefault("CLASH_GROUP", args.clash_group)
+    env["CLASH_API"] = args.clash_api
+    env["CLASH_SECRET"] = args.clash_secret
+    env["CLASH_GROUP"] = args.clash_group
+    task_tuning = {
+        "CLAUDE_RESIDENTIAL_PROFILE_RETRIES": getattr(args, "claude_profile_retries", None),
+        "CLAUDE_HCAPTCHA_SOLVE_RETRIES": getattr(args, "claude_hcaptcha_retries", None),
+        "CODEX_PHONE_SKIP_ATTEMPTS": getattr(args, "codex_phone_skip", None),
+        "CODEX_ADDPHONE_ATTEMPTS": getattr(args, "codex_phone_attempts", None),
+        "CODEX_SMS_TIMEOUT": getattr(args, "codex_sms_timeout", None),
+        "SMS_GETPHONE_RETRIES": getattr(args, "sms_get_phone_retries", None),
+        "CUSTOM_SMS_POOL_FILE": getattr(args, "custom_sms_pool_file", None),
+        "CUSTOM_SMS_ALLOWED_HOSTS": getattr(args, "custom_sms_allowed_hosts", None),
+    }
+    for key, value in task_tuning.items():
+        if value not in (None, ""):
+            env[key] = str(value)
     return env
 
 
 # ---------------------------------------------------------------- Stage A
-def stage_email(args, env):
-    """拉起 outlook_reg_loop.py，盯 emails.txt，拿到一个新号就停。返回 (email, password) 或 None。"""
+def stage_emails(args, env, target_count=1, concurrency=1):
+    """拉起一个 Outlook 生产进程，返回最多 target_count 个新邮箱。"""
+    target_count = max(1, int(target_count or 1))
+    concurrency = max(1, min(target_count, int(concurrency or 1)))
     before = {e for e, _p, _t, _c in read_fresh_emails()}
     log(f"Stage A 邮箱注册启动；emails.txt 现有 {len(before)} 个号", "A")
 
     cmd = [
         sys.executable, "outlook_reg_loop.py",
-        "--count", str(args.email_attempts),
+        "--count", str(max(args.email_attempts, target_count)),
+        "--concurrency", str(concurrency),
         "--timeout", str(args.email_timeout),
         "--max-press", str(args.max_press),
         "--sleep", "3",
@@ -136,7 +218,10 @@ def stage_email(args, env):
         cmd.append("--confirm-before-register")
     log(f"Stage A cmd: {' '.join(cmd)}", "A")
     if args.dry_run:
-        return ("dry-run@outlook.com", "DryRunPass1!", "", "")
+        return [
+            (f"dry-run-{index}@outlook.com", "DryRunPass1!", "", "")
+            for index in range(1, target_count + 1)
+        ]
 
     outlook_env = proxy_switch.platform_environment(env, "outlook")
     log(f"Stage A proxy mode: {proxy_switch.proxy_mode(outlook_env)}", "A")
@@ -145,7 +230,7 @@ def stage_email(args, env):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
-    new_email = None
+    new_emails = []
     try:
         deadline = time.time() + args.email_total_timeout
         # 边读子进程日志边透传，同时每读几行 poll 一次 emails.txt
@@ -163,9 +248,9 @@ def stage_email(args, env):
                 last_check = now
                 cur = read_fresh_emails()
                 fresh = [t for t in cur if t[0] not in before]
-                if fresh:
-                    new_email = fresh[-1]
-                    log(f"检测到新邮箱：{new_email[0]} —— 停止 Stage A 循环", "A")
+                if len(fresh) >= target_count:
+                    new_emails = fresh[:target_count]
+                    log(f"Stage A 已收集 {len(new_emails)}/{target_count} 个新邮箱", "A")
                     break
             if now > deadline:
                 log(f"Stage A 总超时 {args.email_total_timeout}s 仍无新号", "A")
@@ -173,13 +258,18 @@ def stage_email(args, env):
             if not line:
                 time.sleep(0.2)
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-    return new_email
+        _terminate_process_tree(proc)
+        _cleanup_active_profiles(owner=outlook_env.get("REG_FACTORY_RUN_ID"))
+    if not new_emails:
+        fresh = [t for t in read_fresh_emails() if t[0] not in before]
+        new_emails = fresh[:target_count]
+    return new_emails
+
+
+def stage_email(args, env):
+    """兼容原来的单邮箱 Stage A 调用。"""
+    accounts = stage_emails(args, env, target_count=1, concurrency=1)
+    return accounts[0] if accounts else None
 
 
 # ---------------------------------------------------------------- Stage B
@@ -194,9 +284,26 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
         "--token", (token or "fresh"),
         "--platforms", *args.platforms,
         "--node", args.node,
+        "--chatgpt-country", args.chatgpt_country,
         "--timeout", str(args.platform_timeout),
         "--broker", args.broker,
+        "--platform-retries", str(max(0, getattr(args, "platform_retries", 0))),
+        "--grok-timeout", str(max(1, getattr(args, "grok_timeout", 40))),
+        "--claude-profile-retries", str(max(1, getattr(args, "claude_profile_retries", 3))),
+        "--claude-hcaptcha-retries", str(max(1, getattr(args, "claude_hcaptcha_retries", 2))),
+        "--claude-challenge-wait", str(max(0, getattr(args, "claude_challenge_wait", 45))),
+        "--claude-challenge-node-retries", str(max(0, getattr(args, "claude_challenge_node_retries", 3))),
+        "--claude-captcha-manual-timeout", str(max(0, getattr(args, "claude_captcha_manual_timeout", 0))),
+        "--codex-sms-provider", getattr(args, "codex_sms_provider", "auto"),
+        "--codex-timeout", str(max(1, getattr(args, "codex_timeout", 120))),
+        "--codex-phone-skip", str(max(0, getattr(args, "codex_phone_skip", 0))),
+        "--codex-phone-attempts", str(max(1, getattr(args, "codex_phone_attempts", 2))),
+        "--codex-sms-timeout", str(max(1, getattr(args, "codex_sms_timeout", 150))),
+        "--sms-get-phone-retries", str(max(1, getattr(args, "sms_get_phone_retries", 4))),
+        "--grok-mailbox-attempts", str(max(1, getattr(args, "grok_mailbox_attempts", 6))),
     ]
+    if not getattr(args, "sequential_platforms", False):
+        cmd.append("--parallel")
     if client_id and client_id != "fresh":
         cmd += ["--client-id", client_id]
     if args.keep_on_fail:
@@ -211,15 +318,102 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
             cmd += ["--codex-group", args.codex_group]
         if args.codex_manual_phone:
             cmd.append("--codex-manual-phone")
+        if getattr(args, "codex_phone", ""):
+            cmd += ["--codex-phone", args.codex_phone]
     if args.grok_sub2api:
         cmd.append("--grok-sub2api")
         if args.grok_sub2api_group:
             cmd += ["--grok-sub2api-group", args.grok_sub2api_group]
+    if getattr(args, "kiro_account_password", ""):
+        cmd += ["--kiro-account-password", args.kiro_account_password]
+    if getattr(args, "kiro_full_name", ""):
+        cmd += ["--kiro-full-name", args.kiro_full_name]
+    if getattr(args, "custom_sms_pool_file", ""):
+        cmd += ["--custom-sms-pool-file", args.custom_sms_pool_file]
+    if getattr(args, "custom_sms_allowed_hosts", ""):
+        cmd += ["--custom-sms-allowed-hosts", args.custom_sms_allowed_hosts]
+    if getattr(args, "skip_claude_validation", False):
+        cmd.append("--no-claude-auto-validate")
     log(f"Stage B cmd: {redact_command(cmd)}", "B")
     if args.dry_run:
         return 0
     proc = subprocess.Popen(cmd, cwd=DATA_ROOT, env=env)
-    return proc.wait()
+    try:
+        return proc.wait()
+    finally:
+        _terminate_process_tree(proc)
+
+
+def _normalized_platforms(platforms):
+    if isinstance(platforms, str):
+        platforms = [platforms]
+    if not isinstance(platforms, (list, tuple)):
+        return ["claude"]
+    return list(dict.fromkeys(
+        str(platform).strip() for platform in platforms if str(platform).strip()
+    )) or ["claude"]
+
+
+def platform_for_slot(platforms, slot):
+    """Select exactly one platform for one newly registered mailbox."""
+    choices = _normalized_platforms(platforms)
+    return choices[int(slot or 0) % len(choices)]
+
+
+def _args_for_platform(args, platform):
+    account_args = copy.copy(args)
+    account_args.platforms = [platform]
+    return account_args
+
+
+def run_wave(args, env, target_count, platform_offset=0):
+    """并发产出一批邮箱，再并发运行每个邮箱的平台注册管线。"""
+    plan = build_worker_plan("full-flow", target_count, args.concurrency, env)
+    plan.log()
+    wave_size = plan.effective_concurrency
+    accounts = stage_emails(args, env, target_count=wave_size, concurrency=wave_size)
+    if not accounts:
+        return [(1, "")]
+
+    def run_account(index, account):
+        email, password, token, client_id = account
+        account_env = plan.worker(index).merged_environment(env)
+        platform = platform_for_slot(
+            getattr(args, "platforms", ["claude"]),
+            int(platform_offset or 0) + index - 1,
+        )
+        account_args = _args_for_platform(args, platform)
+        log(f"邮箱 {email} 本轮只分配平台 {platform}", "B")
+        started = time.time()
+        rc = stage_platforms(
+            account_args,
+            account_env,
+            email,
+            password or args.password,
+            token,
+            client_id,
+        )
+        log(
+            f"管线结束 email={email} exit={rc} 用时={time.time() - started:.0f}s",
+            "OK" if rc == 0 else "WARN",
+        )
+        return rc, email
+
+    results = []
+    with ThreadPoolExecutor(max_workers=plan.effective_concurrency) as executor:
+        futures = {
+            executor.submit(run_account, index, account): account[0]
+            for index, account in enumerate(accounts, 1)
+        }
+        for future in as_completed(futures):
+            email = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                log(f"管线异常 email={email}: {exc}", "ERR")
+                results.append((1, email))
+    _cleanup_active_profiles(owner=env.get("REG_FACTORY_RUN_ID"))
+    return results
 
 
 # ---------------------------------------------------------------- 单轮
@@ -244,7 +438,11 @@ def run_once(args, env):
 
     # Stage B
     print("=" * 64)
-    rc = stage_platforms(args, env, email, password, token, client_id)
+    platform = platform_for_slot(getattr(args, "platforms", ["claude"]), 0)
+    account_args = _args_for_platform(args, platform)
+    log(f"邮箱 {email} 只分配平台 {platform}", "B")
+    rc = stage_platforms(account_args, env, email, password, token, client_id)
+    _cleanup_active_profiles(owner=env.get("REG_FACTORY_RUN_ID"))
     print("=" * 64)
     dt = time.time() - t0
     log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
@@ -269,13 +467,25 @@ def main():
     ap.add_argument("--rounds", type=int, default=1,
                     help="循环注册轮数；1=只跑一次(默认)，0=无限循环(Ctrl+C 停)")
     ap.add_argument("--round-sleep", type=int, default=5, help="每轮之间间隔(s)")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="同时运行的端到端邮箱管线数")
     # Stage B
-    ap.add_argument("--platforms", nargs="+", choices=["claude", "chatgpt", "grok", "kiro"],
-                    default=["claude"], help="默认只跑 claude（最稳）；grok 已知死结")
+    ap.add_argument("--platforms", nargs="+", choices=["claude", "chatgpt", "grok", "kiro", "github"],
+                    default=["claude"], help="每个邮箱只注册一个平台；传多个平台时按邮箱轮询分配")
     ap.add_argument("--node", default="auto", help="claude/chatgpt/grok 走的 Clash 节点")
+    ap.add_argument(
+        "--chatgpt-country", default="auto",
+        help="ChatGPT 注册出口国家：auto 或两位 ISO 国家码",
+    )
     ap.add_argument("--platform-timeout", type=int, default=600)
+    ap.add_argument("--platform-retries", type=int, default=0,
+                    help="单个平台失败后的额外重试次数")
     ap.add_argument("--broker", default="", help="共享取码服务URL；默认空=各脚本自行开 Outlook 取码")
+    ap.add_argument("--grok-timeout", type=int, default=40,
+                    help="Grok 共享邮箱 broker 取码超时(秒)")
     ap.add_argument("--keep-on-fail", action="store_true")
+    ap.add_argument("--sequential-platforms", action="store_true",
+                    help="兼容旧参数；每个邮箱只运行一个平台")
     ap.add_argument("--import-c2a", action="store_true",
                     help="chatgpt 注册成功后即时把 token 导入 chatgpt2api（透传到底层 register_chatgpt.py）")
     ap.add_argument("--plus-subscription", action="store_true",
@@ -286,10 +496,47 @@ def main():
                     help="SUB2API 目标分组名（透传，默认取 config.SUB2API_GROUP）")
     ap.add_argument("--codex-manual-phone", action="store_true",
                     help="Codex add-phone 手动模式：不接码，自己在浏览器填号收码（透传）")
+    ap.add_argument("--codex-phone", default="",
+                    help="自定义手机号(E.164)：自动填写并等待手动输入验证码")
+    ap.add_argument("--codex-sms-provider",
+                    choices=["auto", "custom", "hero", "smsman", "firefox"],
+                    default="auto", help="Codex add-phone 接码平台")
+    ap.add_argument("--codex-timeout", type=int, default=120,
+                    help="Codex OAuth 授权捕获超时(秒)")
+    ap.add_argument("--codex-phone-skip", type=int, default=0,
+                    help="正式接码前尝试免手机授权的次数")
+    ap.add_argument("--codex-phone-attempts", type=int, default=2,
+                    help="Codex add-phone 最大换号次数")
+    ap.add_argument("--codex-sms-timeout", type=int, default=150,
+                    help="Codex 单个手机号等待验证码秒数")
+    ap.add_argument("--sms-get-phone-retries", type=int, default=4,
+                    help="接码平台无库存时的取号重试次数")
+    ap.add_argument("--custom-sms-pool-file", default="",
+                    help="自定义接码号码池 JSON；留空使用 WebUI 已导入的默认池")
+    ap.add_argument("--custom-sms-allowed-hosts", default="",
+                    help="允许自定义接码记录域名使用非公网 DNS；逗号分隔，留空保持严格校验")
     ap.add_argument("--grok-sub2api", action="store_true",
                     help="Grok 注册成功后转为 SUB2API Grok OAuth 账号（透传）")
     ap.add_argument("--grok-sub2api-group", default=None,
                     help="SUB2API Grok 目标分组名（默认取 SUB2API_GROK_GROUP）")
+    ap.add_argument("--grok-mailbox-attempts", type=int, default=6,
+                    help="Grok 发码失败时的邮箱尝试次数")
+    ap.add_argument("--claude-profile-retries", type=int, default=3,
+                    help="Claude 住宅出口被拒时的新 Profile 总尝试次数")
+    ap.add_argument("--claude-hcaptcha-retries", type=int, default=2,
+                    help="Claude hCaptcha 自动求解尝试次数")
+    ap.add_argument("--claude-challenge-wait", type=int, default=45,
+                    help="Claude 每个节点等待 Cloudflare 自动通过的秒数")
+    ap.add_argument("--claude-challenge-node-retries", type=int, default=3,
+                    help="Claude 提交邮箱前的节点轮换次数")
+    ap.add_argument("--claude-captcha-manual-timeout", type=int, default=0,
+                    help="Claude 等待人工验证秒数；0 表示关闭")
+    ap.add_argument("--skip-claude-validation", action="store_true",
+                    help="跳过 Claude 对历史 sessionKey 的全量收尾校验")
+    ap.add_argument("--kiro-account-password", default="",
+                    help="Kiro Builder ID 密码；留空自动生成")
+    ap.add_argument("--kiro-full-name", default="Test User",
+                    help="Kiro Builder ID 显示名称")
     # 基建
     ap.add_argument("--proxy", default=PROXY_DEFAULT, help="HTTP(S)_PROXY；传空串禁用")
     ap.add_argument("--clash-api", default=CLASH_API_DEFAULT)
@@ -300,32 +547,51 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
     args = ap.parse_args()
 
+    if args.concurrency < 1:
+        raise SystemExit("--concurrency 必须大于等于 1")
+
     if args.skip_email and args.rounds != 1:
         # --skip-email 每轮都用同一个固定邮箱，循环没意义（甚至会重复注册同号）
         raise SystemExit("--skip-email 只能跑单轮，不能配合 --rounds")
+    if args.skip_email and len(_normalized_platforms(args.platforms)) > 1:
+        raise SystemExit("--skip-email 使用固定邮箱时只能选择一个平台")
 
     env = build_child_env(args)
+    env.setdefault("REG_FACTORY_RUN_ID", f"full-flow-{os.getpid()}-{int(time.time() * 1000)}")
     t_all = time.time()
     print("=" * 64)
     mode = "无限" if args.rounds == 0 else f"{args.rounds} 轮"
-    log(f"全流程开始（循环 {mode}）  proxy={args.proxy or 'OFF'}  clash={args.clash_api}")
+    platform_mode = "顺序" if args.sequential_platforms else "并行"
+    traffic_mode = env.get("REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE", "balanced")
+    log(f"全流程开始（循环 {mode}）  proxy={args.proxy or 'OFF'}  clash={args.clash_api}"
+        f"  concurrency={args.concurrency}  platforms={platform_mode}  traffic={traffic_mode}")
     print("=" * 64)
 
     ok = fail = 0
     rnd = 0
     last_rc = 0
     try:
+        if args.skip_email:
+            last_rc, _email = run_once(args, env)
+            ok = int(last_rc == 0)
+            fail = int(last_rc != 0)
+            rnd = 1
         while args.rounds == 0 or rnd < args.rounds:
-            rnd += 1
+            if args.skip_email:
+                break
+            remaining = args.concurrency if args.rounds == 0 else args.rounds - rnd
+            wave_target = min(args.concurrency, remaining)
             print("#" * 64)
-            log(f"===== 第 {rnd} 轮{'' if args.rounds == 0 else f'/{args.rounds}'} =====")
+            log(f"===== 并发波次开始 completed={rnd} target={wave_target} =====")
             print("#" * 64)
-            rc, _email = run_once(args, env)
-            last_rc = rc
-            if rc == 0:
-                ok += 1
-            else:
-                fail += 1
+            results = run_wave(args, env, wave_target, platform_offset=rnd)
+            for rc, _email in results:
+                rnd += 1
+                last_rc = rc
+                if rc == 0:
+                    ok += 1
+                else:
+                    fail += 1
             # 最后一轮不必再睡
             more = args.rounds == 0 or rnd < args.rounds
             if more and args.round_sleep > 0 and not args.dry_run:
@@ -333,6 +599,8 @@ def main():
                 time.sleep(args.round_sleep)
     except KeyboardInterrupt:
         log("收到 Ctrl+C，停止循环", "WARN")
+    finally:
+        _cleanup_active_profiles(owner=env.get("REG_FACTORY_RUN_ID"))
 
     dt = time.time() - t_all
     print("=" * 64)

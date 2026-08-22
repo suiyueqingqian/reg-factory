@@ -16,10 +16,16 @@ SUB2API 包办 PKCE/换码，三步:
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import re
+import struct
 import sys
 import time
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
+
+import requests
 
 from common.uploaders import _origin, _sub2api_request, DEFAULT_TIMEOUT
 
@@ -33,6 +39,20 @@ REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEFAULT_CONCURRENCY = 10
 DEFAULT_PRIORITY = 1
 DEFAULT_RATE_MULTIPLIER = 1
+
+
+def _totp_code(secret, timestamp=None):
+    """Generate a six-digit RFC 6238 code without adding a dependency."""
+    normalized = re.sub(r"[^A-Z2-7]", "", str(secret or "").upper())
+    if not normalized:
+        raise ValueError("2FA secret is empty")
+    normalized += "=" * (-len(normalized) % 8)
+    key = base64.b32decode(normalized, casefold=True)
+    counter = int((time.time() if timestamp is None else timestamp) // 30)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{value % 1_000_000:06d}"
 # 授权页可能出现的"同意/继续"按钮文案(多语言：英/简中/繁中/日/马来)
 # 注：代理 IP 地区决定 OpenAI 界面语言(JP 节点→日文、HK/TW→繁中、MY→马来)，必须覆盖全，
 # 否则 data-dd-action-name/submit 选择器漏掉时，纯靠文案匹配会因缺语种而点不到、卡死。
@@ -48,6 +68,9 @@ CONSENT_LABELS = [
     "続ける", "次へ", "はい", "ChatGPT で続行",
     # 马来
     "Teruskan", "Benarkan", "Sahkan", "Setuju",
+    # 捷克
+    "Přijmout", "Povolit", "Pokračovat", "Ano", "Další", "Souhlasím",
+    "Přijmout a pokračovat",
 ]
 
 
@@ -84,6 +107,112 @@ def generate_auth_url(origin, token, redirect_uri=REDIRECT_URI, timeout=DEFAULT_
     if not auth_url or not session_id:
         raise RuntimeError("SUB2API 未返回完整 auth_url / session_id")
     return auth_url, session_id, state
+
+
+def _cpa_headers(mgmt_key: str) -> dict:
+    key = str(mgmt_key or "").strip()
+    if not key:
+        raise ValueError("CPA 管理密钥为空")
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+        "X-Management-Key": key,
+    }
+
+
+def _cpa_origin(base_url: str) -> str:
+    origin = _origin(base_url)
+    return origin.rstrip("/")
+
+
+def generate_cpa_auth_url(base_url, mgmt_key, timeout=DEFAULT_TIMEOUT):
+    """Ask CPA to create a Codex URL, keeping PKCE/state ownership in CPA."""
+    url = f"{_cpa_origin(base_url)}/v0/management/codex-auth-url"
+    try:
+        response = requests.get(url, headers=_cpa_headers(mgmt_key), timeout=timeout)
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if not response.ok:
+            detail = payload.get("error") or payload.get("message") if isinstance(payload, dict) else ""
+            raise RuntimeError(f"CPA 生成授权地址失败 HTTP {response.status_code}: {detail or response.text[:240]}")
+    except requests.RequestException as exc:
+        raise RuntimeError(f"CPA 生成授权地址请求异常: {exc}") from exc
+    data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+    auth_url = str(
+        (payload.get("url") if isinstance(payload, dict) else "")
+        or (payload.get("auth_url") if isinstance(payload, dict) else "")
+        or data.get("url")
+        or data.get("auth_url")
+        or ""
+    ).strip()
+    state = str(
+        (payload.get("state") if isinstance(payload, dict) else "")
+        or data.get("state")
+        or _state_from_url(auth_url)
+        or ""
+    ).strip()
+    if not auth_url.startswith(("http://", "https://")):
+        raise RuntimeError("CPA 未返回有效 auth_url")
+    if not state:
+        raise RuntimeError("CPA 授权地址缺少 state")
+    return auth_url, state
+
+
+def callback_url(code: str, state: str, auth_url: str = "", redirect_uri: str = REDIRECT_URI) -> str:
+    """Build the callback URL expected by CPA from a captured OAuth result."""
+    target = str(redirect_uri or "").strip() or REDIRECT_URI
+    try:
+        query_redirect = parse_qs(urlparse(str(auth_url or "")).query).get("redirect_uri", [""])[0]
+        parsed = urlparse(query_redirect)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and parsed.path:
+            target = query_redirect
+    except Exception:
+        pass
+    separator = "&" if "?" in target else "?"
+    return f"{target}{separator}{urlencode({'code': str(code or ''), 'state': str(state or '')})}"
+
+
+def submit_cpa_callback(
+    base_url,
+    mgmt_key,
+    callback: str,
+    timeout=DEFAULT_TIMEOUT,
+    retries=5,
+    retry_delay=3,
+):
+    """Submit a callback to CPA, retrying only transient management failures."""
+    callback = str(callback or "").strip()
+    if not callback:
+        raise ValueError("OAuth callback 为空")
+    url = f"{_cpa_origin(base_url)}/v0/management/oauth-callback"
+    body = {"provider": "codex", "redirect_url": callback}
+    headers = _cpa_headers(mgmt_key)
+    last = None
+    for attempt in range(max(1, int(retries or 1))):
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=timeout)
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if response.ok:
+                if isinstance(payload, dict) and payload.get("success") is False:
+                    raise RuntimeError(str(payload.get("error") or payload.get("message") or "CPA callback rejected"))
+                return payload if isinstance(payload, dict) else {"raw": response.text[:500]}
+            detail = payload.get("error") or payload.get("message") if isinstance(payload, dict) else ""
+            error = RuntimeError(f"CPA callback HTTP {response.status_code}: {detail or response.text[:240]}")
+            retryable = response.status_code in {409, 429, 500, 502, 503, 504}
+            if not retryable:
+                raise error
+            last = error
+        except requests.RequestException as exc:
+            last = exc
+        if attempt + 1 < max(1, int(retries or 1)):
+            time.sleep(max(0.2, float(retry_delay or 3)) * (attempt + 1))
+    raise RuntimeError(f"CPA callback 提交失败: {last}") from last
 
 
 def _state_from_url(url):
@@ -143,8 +272,12 @@ async def _has_phone_error(page):
         txt = (await page.inner_text("body")).lower()
     except Exception:
         return False
-    for kw in ["can't be used", "cannot be used", "not valid", "invalid", "unable to",
-               "try another", "different phone", "not supported", "already", "too many"]:
+    for kw in [
+        "can't be used", "cannot be used", "not valid", "invalid", "unable to",
+        "try another", "different phone", "not supported", "already", "too many",
+        "couldn't send a text message", "could not send a text message",
+        "switched to whatsapp", "send a verification code on whatsapp",
+    ]:
         if kw in txt:
             return True
     return False
@@ -351,7 +484,10 @@ async def _wait_for_phone_flow_exit(page, timeout=20):
     return False
 
 
-async def _goto_add_phone(page, auth_url, account_email, timeout=45):
+async def _goto_add_phone(
+    page, auth_url, account_email, timeout=45, email_code_provider=None,
+    totp_secret="", account_password="",
+):
     """(重新)走到 add-phone 输手机号页:导航 auth_url → 选账号 → 落到 add-phone 且 #tel 可见。
     用于换号前把页面退回干净的输手机号状态。"""
     # 若 OTP 页有"换个号码/返回"入口，先点(更轻);点不到就重新导航
@@ -374,6 +510,8 @@ async def _goto_add_phone(page, auth_url, account_email, timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
         url = page.url
+        if _is_authorization_advanced_url(url):
+            return False
         if _is_phone_flow_url(url):
             try:
                 await page.locator("#tel").wait_for(state="visible", timeout=4000)
@@ -388,10 +526,33 @@ async def _goto_add_phone(page, auth_url, account_email, timeout=45):
             part in url for part in ("/log-in", "/email-verification")
         ):
             print("  [add-phone] 换号授权要求重新登录，自动完成邮箱验证...")
-            ok, message = await _complete_auth_email_login(page, account_email)
+            ok, message = await _complete_auth_email_login(
+                page,
+                account_email,
+                email_code_provider=email_code_provider,
+                account_password=account_password,
+            )
             if not ok:
                 print(f"  [add-phone] 重新登录失败: {message}")
                 return False
+            await asyncio.sleep(0.5)
+            auth_url_lower = page.url.lower()
+            on_authenticator = (
+                "auth.openai.com" in auth_url_lower
+                and any(
+                    marker in auth_url_lower
+                    for marker in ("/mfa", "multi-factor", "two-factor", "totp", "authenticator")
+                )
+            )
+            if on_authenticator:
+                if not totp_secret:
+                    print("  [add-phone] 重新登录要求验证器 2FA，但没有提供密钥")
+                    return False
+                print("  [add-phone] 重新登录进入验证器 2FA，正在提交动态码...")
+                ok, message = await _complete_authenticator_login(page, totp_secret)
+                if not ok:
+                    print(f"  [add-phone] 重新登录 2FA 失败: {message}")
+                    return False
             deadline = time.time() + timeout
             await asyncio.sleep(1.5)
             continue
@@ -408,7 +569,11 @@ async def _goto_add_phone(page, auth_url, account_email, timeout=45):
     return False
 
 
-async def handle_add_phone(page, auth_url="", account_email="", attempts=None, sms_timeout=None, sms_provider="auto"):
+async def handle_add_phone(
+    page, auth_url="", account_email="", attempts=None, sms_timeout=None,
+    sms_provider="auto", email_code_provider=None, totp_secret="",
+    account_password="",
+):
     """auth.openai.com/add-phone:接码平台租号→填→收码→提交，被拒/收不到码就**回退页面**换号重试。
     成功(离开 add-phone)返回 True。
 
@@ -443,7 +608,12 @@ async def handle_add_phone(page, auth_url="", account_email="", attempts=None, s
                     print("  [add-phone] 缺 auth_url 无法回退，终止")
                     break
                 print("  [add-phone] 回退到输手机号页...")
-                if not await _goto_add_phone(page, auth_url, account_email):
+                if not await _goto_add_phone(
+                    page, auth_url, account_email,
+                    email_code_provider=email_code_provider,
+                    totp_secret=totp_secret,
+                    account_password=account_password,
+                ):
                     if not _is_phone_flow_url(page.url):
                         if _is_authorization_advanced_url(page.url):
                             print("  [add-phone] 已离开 add-phone，继续处理授权回调")
@@ -458,6 +628,8 @@ async def handle_add_phone(page, auth_url="", account_email="", attempts=None, s
             # 常成分钟级干涸，默认 4 次(~32s)轮询太短，调大让本步骤耐心等补货。
             import os as _os
             _retries = int(_os.environ.get("SMS_GETPHONE_RETRIES", "4") or "4")
+            # provider=auto rotates configured SMS vendors between phone attempts;
+            # it does not spend every attempt on SMS-Man.
             phone, cc, pkey = sms.get_phone(SMS_PROJECT_ID_OPENAI, HERO_SMS_SERVICE_OPENAI,
                                             country_prefer=[""], country_blacklist=SMS_COUNTRY_BLACKLIST_OPENAI,
                                             max_retries=_retries, max_price=SMS_MAXPRICE_OPENAI,
@@ -472,7 +644,22 @@ async def handle_add_phone(page, auth_url="", account_email="", attempts=None, s
                 print("  [add-phone] 号码被拒，换号重试")
                 sms.release(pkey)
                 continue
-            code = sms.get_code(pkey, max_wait=sms_timeout)
+            code_task = asyncio.create_task(
+                asyncio.to_thread(sms.get_code, pkey, max_wait=sms_timeout)
+            )
+            delivery_failed = False
+            while not code_task.done():
+                done, _ = await asyncio.wait({code_task}, timeout=1.0)
+                if done:
+                    break
+                if _is_phone_flow_url(page.url) and await _has_phone_error(page):
+                    print("  [add-phone] SMS 发送失败或已切换 WhatsApp，立即换号")
+                    delivery_failed = True
+                    await asyncio.to_thread(sms.release, pkey)
+                    break
+            code = await code_task
+            if delivery_failed:
+                continue
             if not code:
                 print("  [add-phone] 未收到验证码，换号重试")
                 sms.release(pkey)
@@ -519,7 +706,43 @@ async def _click_account(page, account_email=""):
     return False
 
 
-async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_email="", manual_phone=False, semi_phone="", allow_phone=True, sms_provider="auto"):
+async def _complete_authenticator_login(page, secret):
+    """Submit an authenticator-app challenge without exposing the TOTP value."""
+    from common.browser import react_fill
+
+    selector = (
+        'input[name="otp"], input[name="totp"], input[name="code"], '
+        'input[autocomplete="one-time-code"], input[inputmode="numeric"]'
+    )
+    code_input = page.locator(selector).first
+    if await code_input.count() == 0 or not await code_input.is_visible():
+        return False, "OAuth 2FA 页面没有可见验证码输入框"
+    try:
+        code = _totp_code(secret)
+    except Exception as error:
+        return False, f"OAuth 2FA 密钥无效: {str(error)[:80]}"
+    if not await react_fill(page, selector, code, tries=2, verbose=False):
+        return False, "OAuth 2FA 验证码输入未被页面接受"
+    submit = page.locator('button[type="submit"]').first
+    if await submit.count() == 0:
+        return False, "OAuth 2FA 页面没有提交按钮"
+    before = page.url
+    await submit.click()
+    for _ in range(40):
+        await asyncio.sleep(0.5)
+        if page.url != before:
+            return True, "ok"
+        if await page.locator(selector).count() == 0:
+            return True, "ok"
+    return False, "OAuth 2FA 验证码提交后页面未推进"
+
+
+async def drive_authorize(
+    page, auth_url, timeout=120, debug_dump=None, account_email="",
+    manual_phone=False, semi_phone="", allow_phone=True, sms_provider="auto",
+    result_metadata=None, email_code_provider=None, totp_secret="",
+    account_password="",
+):
     """在已登录该账号的页面打开 auth_url，处理账号选择/同意页，捕获 localhost:1455 回调。
     manual_phone=True 时遇到 add-phone 不自动接码，由用户在浏览器手动填号收码，脚本轮询等待。
     semi_phone 非空时(半自动)：脚本自动填该号+选 WhatsApp+发送一次，然后转手动等用户输码。
@@ -530,6 +753,8 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
     manual_hint_shown = False
     semi_sent = False
     auth_login_attempted = False
+    authenticator_attempted = False
+    phone_flow_seen = False
 
     async def _handle(route):
         captured["url"] = route.request.url
@@ -583,7 +808,9 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
                 if on_auth_login and not auth_login_attempted:
                     auth_login_attempted = True
                     ok, login_msg = await _complete_auth_email_login(
-                        page, account_email
+                        page, account_email,
+                        email_code_provider=email_code_provider,
+                        account_password=account_password,
                     )
                     if not ok:
                         return None, None, login_msg
@@ -591,6 +818,27 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
                     continue
             except Exception as error:
                 return None, None, f"OAuth 邮箱登录异常: {str(error)[:100]}"
+            try:
+                auth_url_lower = page.url.lower()
+                on_authenticator = (
+                    "auth.openai.com" in auth_url_lower
+                    and any(
+                        marker in auth_url_lower
+                        for marker in ("/mfa", "multi-factor", "two-factor", "totp", "authenticator")
+                    )
+                )
+                if on_authenticator and not authenticator_attempted:
+                    if not totp_secret:
+                        return None, None, "OAuth 要求验证器 2FA，但账号没有提供 2FA 密钥"
+                    authenticator_attempted = True
+                    print("  [2fa] 检测到验证器挑战，正在提交动态码...")
+                    ok, two_factor_msg = await _complete_authenticator_login(page, totp_secret)
+                    if not ok:
+                        return None, None, two_factor_msg
+                    await asyncio.sleep(1.0)
+                    continue
+            except Exception as error:
+                return None, None, f"OAuth 2FA 处理异常: {str(error)[:100]}"
             # 账号选择页:先选账号
             try:
                 if "choose-an-account" in page.url or "/account" in page.url:
@@ -603,6 +851,7 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
             # 脚本只轮询等待离开 add-phone 页；否则走接码自动过。
             try:
                 if _is_phone_flow_url(page.url):
+                    phone_flow_seen = True
                     if not allow_phone:
                         # 本次只赌"免手机直连"，弹了手机就立刻退出(不接码不花钱)，交给上层换会话重试
                         print("  [add-phone] 本次免手机策略：检测到要手机验证，跳过本次(不接码)")
@@ -635,9 +884,17 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
                         auth_url=auth_url,
                         account_email=account_email,
                         sms_provider=sms_provider,
+                        email_code_provider=email_code_provider,
+                        totp_secret=totp_secret,
+                        account_password=account_password,
                     )
                     if not ok:
                         return None, None, "add-phone 手机验证失败(接码换号都没过)"
+                    # The localhost callback can fail to render and trigger an
+                    # auth-url retry. That retry may require email and TOTP
+                    # again even though the phone challenge already passed.
+                    auth_login_attempted = False
+                    authenticator_attempted = False
                     # add-phone 自动接码可能耗时数分钟，把原 deadline 吃光。过了之后给
                     # 后续「同意页→捕获 localhost:1455 回调」一段独立的新预算，否则刚过手机
                     # 验证就因 deadline 已到而退出、卡在 /codex/consent 拿不到回调。
@@ -760,6 +1017,8 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
             return None, None, f"授权返回 error={err}"
         if not code:
             return None, None, "回调缺少 code"
+        if isinstance(result_metadata, dict):
+            result_metadata["codex_phone_status"] = "verified" if phone_flow_seen else "not_verified"
         return code, state, "ok"
     finally:
         for pat in ("http://localhost:1455/**", "http://127.0.0.1:1455/**"):
@@ -845,7 +1104,7 @@ def make_reset_page(
     return reset_page
 
 
-async def _icloud_existing_codes(email):
+async def _icloud_existing_codes(email, token=None, api_key=None, base_url=None):
     """Read current codes so the OAuth login cannot reuse the signup code."""
     if not email or email.rsplit("@", 1)[-1].lower() not in {
         "icloud.com", "me.com", "mac.com"
@@ -856,7 +1115,14 @@ async def _icloud_existing_codes(email):
     loop = asyncio.get_running_loop()
     messages = await loop.run_in_executor(
         None,
-        lambda: fetch_messages(email, "icloud", email=email),
+        lambda: fetch_messages(
+            email,
+            "icloud",
+            email=email,
+            token=token,
+            api_key=api_key,
+            base_url=base_url,
+        ),
     )
     codes = set()
     for message in messages or []:
@@ -871,16 +1137,56 @@ async def _icloud_existing_codes(email):
     return codes
 
 
-async def _complete_auth_email_login(page, account_email):
+async def _complete_auth_email_login(
+    page, account_email, email_code_provider=None, account_password=""
+):
     """Finish the Codex OAuth email login when the ChatGPT cookie is insufficient."""
     if not account_email:
         return False, "OAuth 要求重新登录，但无法确定账号邮箱"
 
     from common.browser import react_fill
 
-    known_codes = await _icloud_existing_codes(account_email)
-    email_input = page.locator('input[type="email"], input[name="email"]').first
-    if await email_input.count() > 0:
+    known_codes = (
+        await _icloud_existing_codes(account_email)
+        if email_code_provider is None else set()
+    )
+    code_requested_at = time.time()
+
+    async def submit_password():
+        nonlocal code_requested_at
+        password_input = page.locator(
+            'input[type="password"], input[name="password"]'
+        ).first
+        if await password_input.count() == 0 or not await password_input.is_visible():
+            return False, "OAuth 密码页没有可见密码输入框"
+        if not account_password:
+            return False, "OAuth 进入密码页，但该 Plus 卡密没有提供账号密码"
+        if not await react_fill(
+            page,
+            'input[type="password"], input[name="password"]',
+            account_password,
+            tries=2,
+            verbose=False,
+        ):
+            return False, "OAuth 账号密码输入未被页面接收"
+        submit = page.locator('button[type="submit"]').first
+        if await submit.count() == 0:
+            return False, "OAuth 密码页没有 Continue 按钮"
+        await submit.click()
+        code_requested_at = time.time()
+        return True, "ok"
+
+    password_submitted = False
+    if "/password" in page.url.lower():
+        ok, message = await submit_password()
+        if not ok:
+            return False, message
+        password_submitted = True
+
+    email_input = None
+    if not password_submitted:
+        email_input = page.locator('input[type="email"], input[name="email"]').first
+    if email_input is not None and await email_input.count() > 0:
         if not await react_fill(
             page,
             'input[type="email"], input[name="email"]',
@@ -897,66 +1203,135 @@ async def _complete_auth_email_login(page, account_email):
     code_input = page.locator(
         'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]'
     ).first
-    for _ in range(30):
+    for wait_round in range(120):
         if await code_input.count() > 0:
             break
+        if "/password" in page.url.lower() and not password_submitted:
+            ok, message = await submit_password()
+            if not ok:
+                return False, message
+            password_submitted = True
+            continue
         if "auth.openai.com" not in page.url or not any(
             part in page.url for part in ("/log-in", "/email-verification")
         ):
             return True, "ok"
+        if wait_round in {29, 59} and email_input is not None and await email_input.count() > 0:
+            try:
+                if await email_input.is_visible():
+                    await react_fill(
+                        page,
+                        'input[type="email"], input[name="email"]',
+                        account_email,
+                        tries=2,
+                        verbose=False,
+                    )
+                    retry_submit = page.locator('button[type="submit"]').first
+                    if await retry_submit.count() > 0:
+                        print("  [mail] 登录页未推进，重新提交邮箱...")
+                        await retry_submit.click()
+            except Exception:
+                pass
         await asyncio.sleep(0.5)
     if await code_input.count() == 0:
         return False, f"OAuth 邮箱登录未进入验证码页(当前页 {page.url[:80]})"
 
-    domain = account_email.rsplit("@", 1)[-1].lower()
-    if domain not in {"icloud.com", "me.com", "mac.com"}:
-        return False, "OAuth 要求邮箱验证码；当前仅 iCloud 可在此步骤自动取码"
+    async def fetch_email_code():
+        if email_code_provider is not None:
+            return await email_code_provider(account_email, code_requested_at)
 
-    from common.temp_email import poll_verification_code
+        domain = account_email.rsplit("@", 1)[-1].lower()
+        if domain not in {"icloud.com", "me.com", "mac.com"}:
+            return None
 
-    code = await poll_verification_code(
-        account_email,
-        "icloud",
-        email=account_email,
-        max_wait=120,
-        poll_interval=4,
-        code_regex=r"\b(\d{6})\b",
-        exclude_codes=tuple(known_codes),
-    )
-    if not code:
-        return False, "OAuth iCloud 验证码超时"
-    if not await react_fill(
-        page,
-        'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]',
-        str(code),
-        tries=2,
-        verbose=False,
-    ):
-        return False, "OAuth 验证码输入未被页面接受"
-    submit = page.locator('button[type="submit"]').first
-    if await submit.count() == 0:
-        return False, "OAuth 验证码页没有提交按钮"
-    await submit.click()
+        from common.temp_email import poll_verification_code
 
-    for _ in range(40):
-        if "email-verification" not in page.url and "/log-in" not in page.url:
-            return True, "ok"
-        try:
-            body = (await page.locator("body").inner_text()).lower()
-            if "route error" in body and "text/html" in body:
-                retry = page.get_by_role("button", name="Retry", exact=False)
-                if await retry.count() > 0:
-                    await retry.first.click()
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
+        return await poll_verification_code(
+            account_email,
+            "icloud",
+            email=account_email,
+            max_wait=120,
+            poll_interval=4,
+            code_regex=r"\b(\d{6})\b",
+            exclude_codes=tuple(known_codes),
+        )
+
+    if email_code_provider is None and account_email.rsplit("@", 1)[-1].lower() not in {
+        "icloud.com", "me.com", "mac.com"
+    }:
+        return False, "OAuth 要求邮箱验证码，但当前账号没有可用取码方式"
+
+    max_code_attempts = 5
+    for code_attempt in range(max_code_attempts):
+        code = await fetch_email_code()
+        if not code:
+            return False, "OAuth 邮箱验证码超时"
+        known_codes.add(str(code))
+        if not await react_fill(
+            page,
+            'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]',
+            str(code),
+            tries=2,
+            verbose=False,
+        ):
+            return False, "OAuth 验证码输入未被页面接受"
+        submit = page.locator('button[type="submit"]').first
+        if await submit.count() == 0:
+            return False, "OAuth 验证码页没有提交按钮"
+        await submit.click()
+
+        for _ in range(40):
+            if "email-verification" not in page.url and "/log-in" not in page.url:
+                return True, "ok"
+            try:
+                body = (await page.locator("body").inner_text()).lower()
+                if "route error" in body and "text/html" in body:
+                    retry = page.get_by_role("button", name="Retry", exact=False)
+                    if await retry.count() > 0:
+                        await retry.first.click()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        if code_attempt >= max_code_attempts - 1:
+            break
+        resend = page.locator(
+            'button:has-text("Resend"), a:has-text("Resend"), '
+            'button:has-text("Send new code"), a:has-text("Send new code"), '
+            "button:has-text(\"Didn't get a code\"), a:has-text(\"Didn't get a code\"), "
+            "button:has-text(\"Didn't receive\"), a:has-text(\"Didn't receive\"), "
+            'button:has-text("Try again"), a:has-text("Try again"), '
+            '[aria-label*="resend" i], [data-testid*="resend" i], '
+            'button:has-text("重新发送"), a:has-text("重新发送"), '
+            'button:has-text("重发验证码"), a:has-text("重发验证码")'
+        )
+        clicked = False
+        for index in range(await resend.count()):
+            candidate = resend.nth(index)
+            try:
+                if await candidate.is_visible():
+                    await candidate.click()
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        if not clicked:
+            break
+        code_requested_at = time.time()
+        print(
+            f"  [mail] 邮箱验证码未通过，已请求新码"
+            f"（第 {code_attempt + 2}/{max_code_attempts} 轮）..."
+        )
+        await asyncio.sleep(3)
     return False, f"OAuth 邮箱验证码未完成(当前页 {page.url[:80]})"
 
 
 async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_attempts=3,
                                skip_timeout=120, phone_timeout=600, debug_dump=None,
                                manual_phone=False, semi_phone="", reset_page=None,
-                               sms_provider="auto"):
+                               sms_provider="auto", result_metadata=None,
+                               email_code_provider=None, allow_phone=True,
+                               totp_secret="", account_password=""):
     """Codex 授权重试编排：**先赌 N 次"免手机直连"，每次失败重新生成授权链接(新会话=重新摇风控骰子)，
     实在每次都要手机，最后一次才真接码/手动填号。**
 
@@ -969,9 +1344,13 @@ async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_
     返回 (code, session_id, state, msg)；失败 code 为 None。code 与返回的 session_id/state 必配套。"""
     last_msg = ""
     # phone_skip_attempts 次免手机直连 + 1 次接码兜底；skip<=0 时直接一次性接码(不赌免手机)
-    total = phone_skip_attempts + 1 if phone_skip_attempts > 0 else 1
+    total = (
+        phone_skip_attempts + 1
+        if allow_phone and phone_skip_attempts > 0
+        else max(1, phone_skip_attempts)
+    )
     for attempt in range(total):
-        is_phone_attempt = attempt >= phone_skip_attempts
+        is_phone_attempt = allow_phone and attempt >= phone_skip_attempts
         # 每次尝试前关窗口重开+重登，确保是全新会话(否则同窗口重试不改变风控决定)
         if reset_page is not None:
             try:
@@ -1003,17 +1382,23 @@ async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_
             mode = "手动填号" if manual_phone else ("半自动" if semi_phone else "自动接码")
             print(f"  [codex] 授权尝试 {attempt+1}/{total}（最后一次，放开手机验证：{mode}，上限 {phone_timeout}s）...")
             _budget = phone_timeout
+            attempt_metadata = {}
             _coro = drive_authorize(
                 page, auth_url, timeout=phone_timeout, debug_dump=debug_dump,
                 account_email=account_email, manual_phone=manual_phone, semi_phone=semi_phone,
-                allow_phone=True, sms_provider=sms_provider)
+                allow_phone=True, sms_provider=sms_provider, result_metadata=attempt_metadata,
+                email_code_provider=email_code_provider, totp_secret=totp_secret,
+                account_password=account_password)
         else:
             print(f"  [codex] 授权尝试 {attempt+1}/{total}（免手机直连，弹手机就换会话重试，上限 {skip_timeout}s）...")
             _budget = skip_timeout
+            attempt_metadata = {}
             _coro = drive_authorize(
                 page, auth_url, timeout=skip_timeout, debug_dump=None,
                 account_email=account_email, allow_phone=False,
-                sms_provider=sms_provider)
+                sms_provider=sms_provider, result_metadata=attempt_metadata,
+                email_code_provider=email_code_provider, totp_secret=totp_secret,
+                account_password=account_password)
         # 硬上限：drive_authorize 内部循环若被卡死的 await 阻塞会无视自身 deadline，
         # 这里用 wait_for 兜底(+60s 缓冲)强制超时，避免整轮永久冻结。
         try:
@@ -1023,6 +1408,22 @@ async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_
             print(f"  [codex] 第 {attempt+1} 次硬超时，强制中断重试...")
         last_msg = msg
         if code:
+            if state and not cb_state:
+                last_msg = "OAuth callback 缺少 state，已丢弃本次授权"
+                print(f"  [codex] 第 {attempt+1} 次 callback 缺少 state，重新生成授权链接...")
+                if attempt < total - 1:
+                    await asyncio.sleep(1.5)
+                    continue
+                return None, None, None, last_msg
+            if cb_state and state and cb_state != state:
+                last_msg = "OAuth callback state 不匹配，已丢弃本次授权"
+                print(f"  [codex] 第 {attempt+1} 次 callback state 不匹配，重新生成授权链接...")
+                if attempt < total - 1:
+                    await asyncio.sleep(1.5)
+                    continue
+                return None, None, None, last_msg
+            if isinstance(result_metadata, dict):
+                result_metadata.update(attempt_metadata)
             return code, session_id, cb_state or state, "ok"
         if msg == "ADDPHONE_REQUIRED":
             print(f"  [codex] 第 {attempt+1} 次要手机验证，换新会话重试...")

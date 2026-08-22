@@ -185,7 +185,7 @@ class ICloudMailTests(unittest.TestCase):
         self.assertEqual(sess.calls[0][1], "https://mail.no-replyca.xyz/api/user/email")
         self.assertEqual(
             sess.calls[0][2]["params"],
-            {"type": "icloud", "apikey": "alias-key"},
+            {"type": "icloud", "apikey": "alias-key", "share": "1"},
         )
 
     def test_create_uses_icloud_code_service_query(self):
@@ -205,8 +205,52 @@ class ICloudMailTests(unittest.TestCase):
         self.assertEqual(sess.calls[0][1], "https://mail.no-replyca.xyz/api/user/email")
         self.assertEqual(
             sess.calls[0][2]["params"],
-            {"type": "icloud-code", "service": "openai", "apikey": "test-key"},
+            {
+                "type": "icloud-code",
+                "service": "openai",
+                "apikey": "test-key",
+                "share": "1",
+            },
         )
+        self.assertEqual(mailbox["mail_type"], "icloud-code")
+        self.assertEqual(mailbox["service"], "openai")
+
+    def test_create_builds_keyless_share_url_from_share_token(self):
+        sess = FakeSession([
+            FakeResponse(data={"code": 0, "data": {
+                "email": "icloud@example.com", "share_token": "opaque/token"
+            }}),
+        ])
+        mailbox = temp_email._icloud_create(
+            None, None, None, "test-key", "https://mail.no-replyca.xyz", sess,
+            mail_type="icloud-code", service="openai",
+        )
+
+        expected = "https://mail.no-replyca.xyz/api/share/opaque%2Ftoken"
+        self.assertEqual(mailbox["share_token"], "opaque/token")
+        self.assertEqual(mailbox["share_url"], expected)
+        self.assertEqual(mailbox["mail_api_url"], expected)
+        self.assertEqual(sess.calls[0][2]["params"]["share"], "1")
+
+    def test_create_explicit_chatgpt_purpose_overrides_generic_alias_config(self):
+        sess = FakeSession([
+            FakeResponse(data={"code": 0, "message": "success", "data": {
+                "type": "icloud-code", "email": "openai-code@example.com"
+            }}),
+        ])
+        with patch.object(temp_email, "ICLOUD_MAIL_TYPE", "icloud"), patch.object(
+            temp_email, "_session", return_value=sess
+        ):
+            mailbox = temp_email.create_mailbox(
+                provider="icloud",
+                api_key="test-key",
+                base_url="https://mail.no-replyca.xyz/api/user/email?type=icloud",
+                mail_type="icloud-code",
+                service="openai",
+            )
+
+        self.assertEqual(mailbox["email"], "openai-code@example.com")
+        self.assertEqual(mailbox["mail_type"], "icloud-code")
 
     def test_fetch_maps_provider_code_and_empty_success(self):
         sess = FakeSession([
@@ -231,6 +275,137 @@ class ICloudMailTests(unittest.TestCase):
 
         self.assertEqual(messages[0]["extracted"]["codes"], ["123456"])
         self.assertEqual(sess.calls[1][2]["params"]["email"], "icloud@example.com")
+
+    def test_fetch_accepts_per_account_direct_endpoint(self):
+        sess = FakeSession([
+            FakeResponse(data={"data": {
+                "from": "no-reply@openai.com", "subject": "Your code", "code": "654321"
+            }}),
+        ])
+        messages = temp_email._icloud_fetch(
+            "icloud@example.com",
+            "icloud@example.com",
+            "TWO_FACTOR_SECRET",
+            "",
+            "https://icloud-api.example/s/opaque/icloud@example.com",
+            sess,
+        )
+        self.assertEqual(messages[0]["code"], "654321")
+        self.assertEqual(sess.calls[0][1], "https://icloud-api.example/s/opaque/icloud@example.com")
+        self.assertNotIn("params", sess.calls[0][2])
+
+    def test_fetch_accepts_keyless_share_endpoint(self):
+        sess = FakeSession([
+            FakeResponse(data={"data": {
+                "subject": "Your code", "code": "789012"
+            }}),
+        ])
+        messages = temp_email._icloud_fetch(
+            "icloud@example.com",
+            "icloud@example.com",
+            "",
+            "",
+            "https://icloud-api.example/api/share/share-token",
+            sess,
+        )
+        self.assertEqual(messages[0]["code"], "789012")
+        self.assertEqual(
+            sess.calls[0][1],
+            "https://icloud-api.example/api/share/share-token",
+        )
+        self.assertNotIn("params", sess.calls[0][2])
+
+    def test_fetch_accepts_nested_messages_and_plain_text_endpoint(self):
+        nested = FakeSession([
+            FakeResponse(data={"data": {"messages": [
+                {"subject": "Your code", "text": "Use 246810"},
+            ]}}),
+        ])
+        messages = temp_email._icloud_fetch(
+            "icloud@example.com", "icloud@example.com", "", "",
+            "https://icloud-api.example/s/opaque/icloud@example.com", nested,
+        )
+        self.assertEqual(messages[0]["text"], "Use 246810")
+
+        plain = FakeSession([
+            FakeResponse(data=None, text="OpenAI verification code: 135790"),
+        ])
+        messages = temp_email._icloud_fetch(
+            "icloud@example.com", "icloud@example.com", "", "",
+            "https://icloud-api.example/s/opaque/icloud@example.com", plain,
+        )
+        self.assertIn("135790", messages[0]["text"])
+
+    def test_custom_numeric_pattern_never_falls_back_to_dashed_code(self):
+        dashed = {
+            "from": "no-reply@openai.com",
+            "subject": "Your ChatGPT login code",
+            "html": "<style>.code{color:#2B-2F}</style><p>Enter the code.</p>",
+            "code": "2B-2F",
+            "extracted": {"codes": ["2B-2F"], "links": []},
+        }
+        numeric = {
+            **dashed,
+            "html": "<p>Enter the code.</p>",
+            "code": "654321",
+            "extracted": {"codes": ["654321"], "links": []},
+        }
+        args = (
+            "icloud@example.com", "icloud", "icloud@example.com", "", "",
+            "https://icloud-api.example/s/opaque/icloud@example.com",
+            ("openai",), ("code",), r"\b(\d{6})\b",
+        )
+
+        with patch.object(temp_email, "fetch_messages", return_value=[dashed]):
+            self.assertIsNone(temp_email._scan_once(*args))
+        with patch.object(temp_email, "fetch_messages", return_value=[numeric]):
+            self.assertEqual(temp_email._scan_once(*args), "654321")
+
+
+class RemailMailTests(unittest.TestCase):
+    def test_create_uses_code_order_contract_and_normalizes_token(self):
+        sess = FakeSession([
+            FakeResponse(data={"id": 3365715, "deliveryEmail": "a@outlook.com", "serviceToken": "service-token"}),
+        ])
+        with patch.object(temp_email, "REMAIL_PROJECT_ID", 58), patch.object(
+            temp_email, "REMAIL_EMAIL_SUFFIX", "outlook.com"
+        ):
+            mailbox = temp_email._remail_create(
+                None, None, None, "rk-test", "https://remail.aishop6.com", sess
+            )
+
+        self.assertEqual(mailbox["email"], "a@outlook.com")
+        self.assertEqual(mailbox["token"], "service-token")
+        method, url, kwargs = sess.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            "https://remail.aishop6.com/v1/open/orders?serviceMode=code&supply=private_first",
+        )
+        self.assertEqual(kwargs["json"], {"projectId": 58, "emailSuffix": "outlook.com"})
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer rk-test")
+        self.assertTrue(kwargs["headers"]["Idempotency-Key"])
+
+    def test_fetch_maps_items_and_verification_code(self):
+        sess = FakeSession([
+            FakeResponse(data={"items": [{
+                "sender": "noreply@openai.com",
+                "subject": "Your ChatGPT code",
+                "bodyPreview": "Use 829104 to continue",
+                "verificationCode": "829104",
+            }]}),
+        ])
+        with patch.object(temp_email, "_session", return_value=sess):
+            messages = temp_email.fetch_messages(
+                "3365715", "remail", email="a@outlook.com", token="service-token",
+                api_key="rk-test", base_url="https://remail.aishop6.com",
+            )
+        self.assertEqual(messages[0]["verificationCode"], "829104")
+        self.assertEqual(messages[0]["extracted"]["codes"], ["829104"])
+        self.assertEqual(sess.calls[0][1], "https://remail.aishop6.com/v1/pickup")
+        self.assertEqual(sess.calls[0][2]["params"], {
+            "email": "a@outlook.com", "token": "service-token"
+        })
 
 
 

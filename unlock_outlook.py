@@ -44,6 +44,7 @@ from playwright.async_api import async_playwright
 # 保证脚本被 importlib 从任意路径加载时也能找到 common 包。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import outlook_press as _outlook_press
+from common.browser import open_and_connect, react_fill, teardown
 
 # ── Config ───────────────────────────────────────────────────────────
 BITBROWSER_API  = os.environ.get("BITBROWSER_API", "http://127.0.0.1:54345")
@@ -134,7 +135,10 @@ def _parse_proxy(s):
     return None
 
 def create_browser(name="unlock", proxy_str=None):
-    data = {"name": name, "remark": "outlook unlock",
+    from common.traffic_saver import bitbrowser_profile_defaults
+
+    data = {**bitbrowser_profile_defaults(),
+            "name": name, "remark": "outlook unlock",
             "proxyMethod": 2, "browserFingerPrint": {"coreVersion": "130"}}
     p = _parse_proxy(proxy_str)
     if p:
@@ -147,7 +151,16 @@ def create_browser(name="unlock", proxy_str=None):
     return _bb_post("/browser/update", data)["data"]["id"]
 
 def open_browser(pid):
-    d = _bb_post("/browser/open", {"id": pid})["data"]
+    from common.traffic_saver import bitbrowser_open_payload
+
+    payload = bitbrowser_open_payload(pid)
+    try:
+        d = _bb_post("/browser/open", payload)["data"]
+    except Exception:
+        if "args" not in payload:
+            raise
+        print("  BitBrowser rejected traffic-saving launch args; retrying normally")
+        d = _bb_post("/browser/open", {"id": pid})["data"]
     return d.get("ws") or d.get("webdriver")
 
 def close_browser(pid):
@@ -368,7 +381,14 @@ async def unlock_account(page, context, email, password, tag):
                 if await inp.count() > 0:
                     await inp.click(timeout=5000)  # focus input (触发 React SPA 状态)
                     await asyncio.sleep(0.3)
-                    await inp.fill(email, timeout=15000)
+                    committed = await react_fill(
+                        page,
+                        'input[type="email"],input[name="loginfmt"]',
+                        email,
+                        tries=3,
+                    )
+                    if not committed:
+                        raise RuntimeError("email input did not commit")
                     await asyncio.sleep(0.5)
                     # 点击 Next/Submit 按钮（稳定 ID 优先，文本 fallback）
                     for sel in ['#idSIButton9', '#iNext', 'button[type="submit"]',
@@ -388,7 +408,11 @@ async def unlock_account(page, context, email, password, tag):
                 if await pwd.count() > 0 and not await pwd.input_value():
                     await pwd.click(timeout=5000)
                     await asyncio.sleep(0.3)
-                    await pwd.fill(password, timeout=15000)
+                    committed = await react_fill(
+                        page, 'input[type="password"]', password, tries=3,
+                    )
+                    if not committed:
+                        raise RuntimeError("password input did not commit")
                     await asyncio.sleep(0.5)
                 for sel in ['#idSIButton9', '#iNext', 'button[type="submit"]',
                             'input[type="submit"]']:
@@ -567,19 +591,19 @@ async def worker(accounts, proxy, worker_id, results, graph_attempts, sem):
     async with sem:
         for email, password, raw_line in accounts:
             tag = f"w{worker_id}"
+            bb = None
             pid = None
             print(f"\n[worker-{worker_id}] {email}")
             try:
-                pid = create_browser(f"unlock_{worker_id}", proxy)
-                ws  = open_browser(pid)
-                if not ws:
-                    raise Exception("no WS url from BitBrowser")
+                options = {"proxy_str": proxy} if proxy else {"proxyType": "noproxy"}
 
-                async with async_playwright() as pw:
-                    browser = await pw.chromium.connect_over_cdp(ws)
-                    ctx  = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = ctx.pages[0]       if ctx.pages       else await ctx.new_page()
-
+                async def run_with_session(pw=None):
+                    nonlocal bb, pid
+                    bb, pid, _browser, ctx, page = await open_and_connect(
+                        name=f"unlock_{worker_id}",
+                        p=pw,
+                        browser_options=options,
+                    )
                     outcome = await asyncio.wait_for(
                         unlock_account(page, ctx, email, password, tag),
                         timeout=UNLOCK_TIMEOUT
@@ -606,6 +630,9 @@ async def worker(accounts, proxy, worker_id, results, graph_attempts, sem):
                             f"{'OK' if graph else 'FAILED'}"
                         )
 
+                async with async_playwright() as pw:
+                    await run_with_session(pw)
+
             except asyncio.TimeoutError:
                 print(f"[worker-{worker_id}] {email} => timeout")
                 results.append((email, password, raw_line, "timeout"))
@@ -613,9 +640,8 @@ async def worker(accounts, proxy, worker_id, results, graph_attempts, sem):
                 print(f"[worker-{worker_id}] {email} => error: {e}")
                 results.append((email, password, raw_line, f"error: {str(e)[:80]}"))
             finally:
-                if pid:
-                    close_browser(pid)
-                    delete_browser(pid)
+                if bb is not None and pid:
+                    await teardown(bb, pid, delete=True)
 
 
 # ── File I/O ──────────────────────────────────────────────────────────

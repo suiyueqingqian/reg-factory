@@ -44,11 +44,19 @@
 
 ---
 
+> **中转站：** [天天 AI Pro](https://tiantianai.pro) · [天天 AI](https://tiantianai.co)
+>
+> **卡网地址：** [TTCard](https://ttcard.zeabur.app)
+
 项目将 Outlook 邮箱、ChatGPT、Grok、Claude、Kiro 注册，Codex OAuth、账号导出和下游导入整合到同一个 Web 控制台，同时保留可组合的命令行入口。
+
+当前主版本为 `2.0.0`，重点是低成本并发和极致省流：任务按槽位隔离浏览器与住宅出口，代理池不足时自动降并发；住宅流量模式支持 `extreme`，会抑制后台联网并跳过非关键资源。详见 [2.0.0 更新日志](CHANGELOG.md)。
 
 > 仅用于学习、开发和经授权的测试。密钥、账号、Cookie、Token 和运行日志均应保留在本机，不要提交到仓库。
 
 ## 快速开始
+
+第一次使用建议先阅读 [新手教程](docs/getting-started.md)。教程从下载安装开始，按界面顺序说明网络出口、指纹浏览器、Outlook Graph 辅助邮箱、住宅节流、并发、成功率自动停止、结果检查和升级，不要求先理解命令行或 `.env`。
 
 ### Windows 便携安装包
 
@@ -58,6 +66,8 @@
 
 配置和运行数据默认保存在 `%LOCALAPPDATA%\RegFactory`，升级时直接替换程序目录即可。首次切换到便携包时，如果检测到仍在运行的源码版且其目录包含邮箱、Cookie 或 Token，新版会自动沿用该资产目录。
 
+`1.2.30` 及更早便携版的一键更新启动参数存在问题，需要先从 Releases 手动下载并覆盖安装一次新版。新版的“一键更新”会重试断流下载、校验 SHA-256 与包内版本，并在失败时显示实际原因；数据目录不会随程序目录替换。
+
 为控制体积，Windows 便携包不包含可选的 Codex K12 子项目；需要 K12 时请使用源码方式安装，并准备 Node.js 20+。
 
 ### 从源码运行
@@ -65,7 +75,7 @@
 运行前需要：
 
 - Python 3.10+
-- 默认使用 [RuyiPage](https://github.com/LoseNine/ruyipage) Firefox WebDriver BiDi 指纹浏览器，也支持内置 Chromium、自定义 Chrome/Chromium、BitBrowser 和 AdsPower
+- 默认使用 [BitBrowser](https://www.bitbrowser.cn/download)，也支持内置 Chromium、自定义 Chrome/Chromium 和 AdsPower
 - [Clash Verge 2.5.2 Windows x64](https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.2/Clash.Verge_2.5.2_x64-setup.exe)（自动/固定节点模式），或一个住宅代理服务
 - Node.js 20+（仅 Codex K12 控制台需要）
 
@@ -73,7 +83,7 @@ Windows：
 
 ```text
 1. 双击 install.bat
-2. 首次启动会在后台自动下载 RuyiPage Firefox；启动 Clash Verge
+2. 启动 BitBrowser；使用 Clash 网络模式时同时启动 Clash Verge
 3. 双击 start.bat
 4. 打开 http://127.0.0.1:8799/
 ```
@@ -94,27 +104,34 @@ macOS / Linux：
 - 新手指南：首次打开自动引导 Clash External Controller、控制密码、住宅代理、继承全局、浏览器、Outlook Graph 辅助邮箱、接码、资产 API 和任务勾选配置；支持按阶段跳过并从顶栏重新打开。
 - 任务库：按流程分类选择任务，只展示常用参数，低频参数收进“更多设置”。
 - 运行日志：实时查看输出和结果状态；可停止当前任务树，或一键清理新旧版本遗留的全部注册任务。
-- 邮箱池：批量导入已有 Outlook 邮箱。
-- 资产 API：每次输出前在线校验，只领取本次检测正常且尚未领取的邮箱或平台账号；同一账号跨输出格式只返回一次。
-- 号池扫描：一键校验 Outlook、ChatGPT、Claude、Grok 和 Kiro，查看正常、待解锁、封禁、过期、受限及检测异常明细，并标注 ChatGPT Plus 免费试用资格。
+- 邮箱池：批量导入 Outlook 各地域域名、Hotmail/Live/MSN、iCloud 和自定义邮箱；兼容 JSON、RT/client_id 正反顺序及多种分隔符。
+- 资产 API：直接领取本地尚未领取的邮箱或平台账号，不在取件前在线检测；邮箱可选“仅领取最近扫描为正常”，同一账号跨输出格式只返回一次。
+- 号池扫描：同平台低频串行、近期结果自动复用，遇到限流或连续风控响应自动暂停；按需校验 Outlook、ChatGPT、Claude、Grok 和 Kiro，并标注 ChatGPT Plus 免费试用资格。
 - 网络出口：切换 Clash 自动轮换、固定节点或动态住宅 IP，并测试公网出口。
 - 环境配置：分组编辑 `.env` 并测试外部服务连通性。
 - Codex K12：管理 K12 workspace、邮箱资产、任务与 Codex 凭据。
-- Plus 订阅：ChatGPT 注册任务勾选订阅模式后，成功账号自动进入主 WebUI 的本地 `zkky` 工作台；支持一次导入最多 100 条 AT，按 1-27 的可调并发自动或手动轮换批处理，一次录入卡片后自动应用。提链和绑卡/支付可分别在网络页下拉选择住宅 IP、Clash 当前节点或具体 Clash 节点；缺少其中一种出口时自动回退。也可用 `REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE` 和 `REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE` 显式指定两个固定 Clash 入口。
+- Plus Codex 导入：使用已经开通 Plus 的 ChatGPT 账号，登录后强制完成手机号接码验证，再走 Codex OAuth 并导入 SUB2API；不再执行提链、绑卡或支付。WebUI 支持批量粘贴 Outlook/Hotmail/Live/MSN、iCloud、ChatGPT session Cookie/token 和完整 Codex OAuth JSON，也兼容 RT/client_id 正反顺序及多种分隔符。
 
 控制台只监听本机。Codex K12 的独立说明见 [codex_k12/README.md](codex_k12/README.md)。
 
-动态住宅 IP 会在创建新浏览器窗口时写入完整代理认证；轮换后的代理从下一个新窗口开始使用。网络页可分别设置 Outlook、Claude、ChatGPT、Grok 和 Kiro 的出口，例如 Outlook 使用 Clash、其他平台使用住宅代理，并可按平台测试真实公网 IP。
+动态住宅 IP 会在创建新浏览器窗口时写入完整代理认证；轮换后的代理从下一个新窗口开始使用。网络页可分别设置 Outlook、Claude、ChatGPT、Grok、Kiro 和 GitHub 的出口，例如 Outlook 使用 Clash、其他平台使用住宅代理，并可按平台测试真实公网 IP。
+
+住宅模式默认启用“平衡节流”，浏览器会跳过普通图片、字体和音视频，并保留脚本、样式表以及 Cloudflare、hCaptcha、Arkose、PerimeterX 等验证资源。网络页可以切换到“激进节流”进一步拦截样式表和常见统计请求；Microsoft 登录与 Graph 授权页会保留必要样式表，避免可见状态判断失真。该设置只影响浏览器页面资源，不改变账号 API、代理分配和出口粘性。
+
+并发注册会为每个任务创建独立浏览器 Profile、Cookie 和指纹环境。住宅代理池会按并发槽分配不同端点；没有住宅 IP 时也可把网络模式设为 `clash_fixed`，或在单平台注册任务中指定一个节点，以同一固定公网 IP 并发。`clash_auto` 的节点选择是全局状态，为避免注册中途换 IP 会自动降为单并发。建议先从并发 `2` 开始，固定 Clash 并发需自行承担共享出口带来的关联和限流风险。
 
 ## 本地资产 API
 
-本地接口支持按顺序或指定 `index` 领取邮箱、Claude/ChatGPT/Grok Cookie 和 Kiro Builder ID 账号；`format=cookies` 输出浏览器扩展可导入的标准 JSON，并可把 ChatGPT 会话转换为 SUB2API、CPA 或 chatgpt2api 格式。每个读取请求都会先在线校验对应平台，只从本次检测正常且尚未领取的资产池返回数据，并在响应中附带 `verification`。账号成功返回后会按平台写入领取账本，切换输出格式也不会再次返回；需要复用时必须显式重置领取记录。这只证明检测时刻可用，不代表账号之后不会被目标服务限制。控制台左侧打开“资产 API”即可配置访问密钥、生成调用命令和查看状态。默认仅允许本机访问，可配置 `REG_FACTORY_ASSET_API_KEY`。
+本地接口支持按顺序或指定 `index` 领取邮箱、Claude/ChatGPT/Grok Cookie 和 Kiro Builder ID 账号；`format=cookies` 输出浏览器扩展可导入的标准 JSON，并可把 ChatGPT 会话转换为 SUB2API、CPA 或 chatgpt2api 格式。读取请求直接从本地尚未领取的资产中返回数据，不会先发起在线状态检测。邮箱设置 `normal_only=true` 时只使用最近一次扫描缓存筛选正常状态，领取时仍不联网。账号成功返回后会按平台写入领取账本，切换输出格式也不会再次返回；需要复用时必须显式重置领取记录。号池扫描按平台低频串行并自动复用近期结果，接口响应受网络、出口和目标服务风控影响，不能保证是账号的永久状态。控制台左侧打开“资产 API”即可配置访问密钥、生成调用命令和查看状态。默认仅允许本机访问，可配置 `REG_FACTORY_ASSET_API_KEY`。
 
 ```bash
 # 按顺序取下一个邮箱
 curl "http://127.0.0.1:8799/api/assets/emails?format=json"
 
-# 领取当前未领取健康池中的第 3 个 ChatGPT 账号，输出 SUB2API 格式
+# 只领取最近一次扫描为正常的邮箱（领取时不联网检测）
+curl "http://127.0.0.1:8799/api/assets/emails?normal_only=true"
+
+# 领取当前未领取列表中的第 3 个 ChatGPT 账号，输出 SUB2API 格式
 curl "http://127.0.0.1:8799/api/assets/cookies/chatgpt?format=sub2api&index=2"
 
 # 指定第 1 个 Claude 账号，输出标准浏览器 Cookie JSON
@@ -125,16 +142,19 @@ curl "http://127.0.0.1:8799/api/assets/cookies/chatgpt?format=cpa" \
   -H "X-API-Key: your-key"
 ```
 
-省略 `index` 时领取当前健康池中的第一条；指定 `index` 时从“正常且未领取”的当前范围选择。两种方式都会记录领取，同一平台账号跨格式不重复返回。完整平台格式、响应字段和领取记录重置方式见 [本地资产 API](docs/api.md)。
+省略 `index` 时领取当前未领取列表中的第一条；指定 `index` 时从当前未领取范围选择。两种方式都会记录领取，同一平台账号跨格式不重复返回。完整平台格式、响应字段和领取记录重置方式见 [本地资产 API](docs/api.md)。
 
 ## 常用命令
 
 ```bash
-# Outlook -> Claude / ChatGPT / Grok / Kiro
-python run_full_flow.py --platforms claude chatgpt grok kiro
+# Outlook -> Claude / ChatGPT / Grok / Kiro / GitHub
+python run_full_flow.py --platforms claude chatgpt grok kiro github
 
-# 使用已有邮箱池注册三个平台
-python register_three_platforms.py --from-pool
+# 同时处理 3 个邮箱；每个邮箱内的所选平台默认并行
+python run_full_flow.py --rounds 12 --concurrency 3 --platforms claude chatgpt kiro
+
+# 使用已有邮箱池并行注册多个平台
+python register_three_platforms.py --from-pool --parallel
 
 # 常驻注册 Outlook
 python outlook_reg_loop.py
@@ -158,8 +178,8 @@ python register_chatgpt.py --count 1 --email-provider icloud
 # 使用普通 iCloud 子邮箱接口（/api/user/email?type=icloud&apikey=...）
 # 先在 .env 设置 ICLOUD_MAIL_TYPE=icloud
 
-# ChatGPT 注册成功后进入主 WebUI 的本地 Plus 批处理工作台
-python register_chatgpt.py --count 1 --plus-subscription
+# 已开通 Plus 账号：手机号接码验证 -> Codex OAuth -> SUB2API
+python tools/import_plus_codex.py --accounts-file accounts.txt --sms-provider auto --phone-attempts 3
 
 # Grok 浏览器注册并导入 SUB2API
 python register_grok.py --count 1 --sub2api
@@ -225,6 +245,7 @@ node --check webui/static/app.js
 
 ## 文档
 
+- [新手教程](docs/getting-started.md)
 - [配置说明](docs/configuration.md)
 - [本地资产 API](docs/api.md)
 - [CLI 手册](docs/cli.md)

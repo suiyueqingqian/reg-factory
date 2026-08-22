@@ -11,9 +11,12 @@ import random
 import secrets
 import string
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
+
+import requests as standard_requests
 
 try:
     from curl_cffi import requests as http_requests
@@ -24,7 +27,7 @@ from common import emails as email_pool
 from common import proxy_switch
 from common.kiro_crypto import FingerprintBuilder, _b64url, encrypt_password
 from common.mailbox import get_code_by_token
-from common.session_export import save_kiro_token
+from common.session_export import build_kiro_rs_credentials, save_kiro_token
 
 
 OIDC_BASE = "https://oidc.us-east-1.amazonaws.com"
@@ -36,6 +39,9 @@ DIRECTORY_ID = "d-9067642ac7"
 START_URL = f"{VIEW_BASE}/start"
 SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations",
           "codewhisperer:transformations", "codewhisperer:taskassist"]
+
+_APP_CONFIG_LOCK = threading.Lock()
+_APP_CONFIG_CACHE = None
 
 
 class KiroError(RuntimeError):
@@ -101,6 +107,28 @@ class KiroClient:
         self.client_id = ""
         self.client_secret = ""
 
+    @staticmethod
+    def _is_tls_transport_error(error):
+        message = str(error or "").lower()
+        return any(marker in message for marker in (
+            "tls connect error",
+            "openssl_internal",
+            "invalid library",
+            "ssl connect error",
+        ))
+
+    def _standard_session(self):
+        session = standard_requests.Session()
+        session.verify = False
+        session.headers.update(dict(self.session.headers))
+        try:
+            session.cookies.update(self.session.cookies.get_dict())
+        except Exception:
+            pass
+        if self.proxy:
+            session.proxies = {"http": self.proxy, "https": self.proxy}
+        return session
+
     def _headers(self, referer="", origin="", content_type="application/json"):
         headers = {"Accept": "application/json, text/plain, */*", "Content-Type": content_type,
                    "User-Agent": self.fp.ua, "sec-ch-ua": self.fp.sec_ua,
@@ -118,7 +146,19 @@ class KiroClient:
             kwargs["data"] = data
         elif payload is not None:
             kwargs["json"] = payload
-        response = self.session.request(method, url, **kwargs)
+        try:
+            response = self.session.request(method, url, **kwargs)
+        except Exception as error:
+            if not self._is_tls_transport_error(error):
+                raise
+            print("  [kiro] curl TLS transport failed; retrying with standard requests")
+            fallback = self._standard_session()
+            response = fallback.request(method, url, **kwargs)
+            try:
+                self.session.close()
+            except Exception:
+                pass
+            self.session = fallback
         if expected is not None and response.status_code not in set(expected):
             body = response.text[:400].replace("\n", " ")
             raise KiroError(f"HTTP {response.status_code}: {body}")
@@ -153,9 +193,24 @@ class KiroClient:
         print(f"  [kiro] device code ready: {self.user_code}")
 
     def fetch_app_config(self):
+        global _APP_CONFIG_CACHE
+
         try:
-            response = self.get(f"{SIGNIN_BASE}/assets/js/app.js", headers={"Accept": "*/*", "Referer": f"{SIGNIN_BASE}/"})
-            self.fp.update_app_js(response.text)
+            # app.js is large and identical for every account in one batch.
+            with _APP_CONFIG_LOCK:
+                if _APP_CONFIG_CACHE is None:
+                    response = self.get(
+                        f"{SIGNIN_BASE}/assets/js/app.js",
+                        headers={"Accept": "*/*", "Referer": f"{SIGNIN_BASE}/"},
+                    )
+                    self.fp.update_app_js(response.text)
+                    _APP_CONFIG_CACHE = (
+                        self.fp.key,
+                        self.fp.identifier,
+                        self.fp.version,
+                    )
+                else:
+                    self.fp.key, self.fp.identifier, self.fp.version = _APP_CONFIG_CACHE
         except Exception:
             pass
 
@@ -488,9 +543,41 @@ class KiroClient:
             return {}
 
 
-def register_one(email, mailbox_password, mailbox_token, mailbox_client_id, args):
+def _get_kiro_verification_code(
+    email, mailbox_token, mailbox_client_id, args, *, mailbox=None, sent_at=None
+):
+    """Read the Kiro OTP from Graph or a configured HTTP mailbox provider."""
+    if mailbox:
+        from common.temp_email import poll_verification_code_blocking
+
+        return poll_verification_code_blocking(
+            mailbox.get("id") or mailbox.get("email") or email,
+            mailbox.get("provider") or "custom",
+            email=email,
+            token=mailbox.get("token") or "",
+            api_key=mailbox.get("api_key") or None,
+            base_url=mailbox.get("base_url") or None,
+            max_wait=min(180, args.timeout),
+            poll_interval=5,
+            sender_hint=("amazon", "aws", "signin"),
+            subject_hint=("verification", "confirm", "code", "验证码"),
+        )
+    if not mailbox_token or not mailbox_client_id:
+        raise KiroError("Kiro 注册需要 Outlook refresh token 和 client id 读取验证码")
+    return get_code_by_token(
+        email,
+        mailbox_token,
+        mailbox_client_id,
+        sender_contains=("amazon", "aws", "signin"),
+        subject_contains=("verification", "confirm", "code", "验证码"),
+        max_wait=min(180, args.timeout),
+        poll=5,
+        received_after=sent_at,
+    )
+
+
+def register_one(email, mailbox_password, mailbox_token, mailbox_client_id, args, mailbox=None):
     target_password = args.account_password or _random_password()
-    proxy_switch.apply_platform_environment("kiro")
     proxy = proxy_switch.effective_proxy_url()
     client = KiroClient(proxy=proxy, timeout=args.timeout)
     try:
@@ -504,13 +591,15 @@ def register_one(email, mailbox_password, mailbox_token, mailbox_client_id, args
             raise KiroError("邮箱状态无法进入注册")
         client.signup(email); client.signup_init(email); client.profile_init(); client.profile_start()
         sent_at = client.send_otp(email)
-        if not mailbox_token or not mailbox_client_id:
-            raise KiroError("Kiro 注册需要 Outlook refresh token 和 client id 读取验证码")
         print("  [kiro] waiting for verification code")
-        otp = get_code_by_token(email, mailbox_token, mailbox_client_id,
-                                sender_contains=("amazon", "aws", "signin"),
-                                subject_contains=("verification", "confirm", "code", "验证码"),
-                                max_wait=min(180, args.timeout), poll=5, received_after=sent_at)
+        otp = _get_kiro_verification_code(
+            email,
+            mailbox_token,
+            mailbox_client_id,
+            args,
+            mailbox=mailbox,
+            sent_at=sent_at,
+        )
         if not otp:
             raise KiroError("等待验证码超时")
         registration_code, sign_state = client.create_identity(email, args.full_name, otp)
@@ -519,12 +608,15 @@ def register_one(email, mailbox_password, mailbox_token, mailbox_client_id, args
         sso_token = client.sso_token()
         aws_token = client.device_token()
         kiro_token = client.kiro_authorize(sso_token)
-        record = {"email": email, "password": target_password, "provider": "BuilderId", "region": "us-east-1",
+        raw_record = {"email": email, "provider": "BuilderId", "region": "us-east-1",
                   "clientId": client.client_id, "clientSecret": client.client_secret,
                   "refreshToken": aws_token.get("refreshToken"), "accessToken": aws_token.get("accessToken"),
-                  "expiresIn": aws_token.get("expiresIn"), "kiro": kiro_token, "createdAt": int(time.time())}
-        if not save_kiro_token(record, email):
+                  "expiresIn": aws_token.get("expiresIn")}
+        if kiro_token.get("profileArn"):
+            raw_record["profileArn"] = kiro_token["profileArn"]
+        if not save_kiro_token(raw_record, email):
             raise KiroError("Kiro 凭据落盘失败")
+        record = build_kiro_rs_credentials(raw_record, email)
         return {"status": "success", "email": email, "record": record}
     except Exception as exc:
         return {"status": "failed", "email": email, "error": str(exc)[:300]}
@@ -533,18 +625,48 @@ def register_one(email, mailbox_password, mailbox_token, mailbox_client_id, args
 def main():
     parser = argparse.ArgumentParser(description="Kiro Builder ID registration")
     parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--concurrency", "-c", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--email", default="")
     parser.add_argument("--password", default="", help="Outlook mailbox password")
     parser.add_argument("--refresh-token", default="")
     parser.add_argument("--client-id", default="")
+    parser.add_argument(
+        "--email-provider",
+        choices=("pool", "temp", "custom"),
+        default="pool",
+        help="邮箱来源：pool=Outlook/自有 Graph 邮箱，temp=TEMP_EMAIL_PROVIDER，custom=自建 REST 邮箱 API",
+    )
+    parser.add_argument(
+        "--temp-provider",
+        choices=("", "yyds", "remail", "gptmail", "moemail", "cfmail", "icloud", "custom"),
+        default="",
+        help="--email-provider temp 时覆盖 TEMP_EMAIL_PROVIDER（如 yyds、gptmail、remail、custom）",
+    )
     parser.add_argument("--account-password", default="", help="Kiro account password; empty generates one")
     parser.add_argument("--full-name", default="Test User")
     parser.add_argument("--node", default="auto", help="Compatibility option; proxy is selected from WebUI settings")
     parser.add_argument("--keep-on-fail", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    proxy_switch.apply_platform_environment("kiro")
     if args.email:
+        if args.email_provider != "pool":
+            print("[kiro] --email 仅支持 pool；临时/自建邮箱请省略 --email，由 API 自动分配")
+            return 1
         accounts = [(args.email.strip(), args.password.strip(), args.refresh_token.strip(), args.client_id.strip())]
+    elif args.email_provider in {"temp", "custom"}:
+        from common.temp_email import create_mailbox
+
+        accounts = []
+        provider = "custom" if args.email_provider == "custom" else (args.temp_provider.strip() or None)
+        for _ in range(max(1, args.count)):
+            try:
+                mailbox = create_mailbox(provider=provider)
+                accounts.append((mailbox["email"], "", "", "", mailbox))
+                print(f"[kiro] mailbox allocated provider={mailbox.get('provider')}: {mailbox['email']}")
+            except Exception as exc:
+                print(f"[kiro] mailbox allocation failed: {str(exc)[:220]}")
+                break
     else:
         accounts = []
         for _ in range(max(1, args.count)):
@@ -557,17 +679,47 @@ def main():
     if not accounts:
         print("[kiro] no mailbox available")
         return 1
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from common.concurrency import build_worker_plan
+    from common.task_context import activate_worker
+
+    worker_plan = build_worker_plan("kiro", len(accounts), args.concurrency)
+    worker_plan.log()
+
+    def run_lane(slot):
+        output = []
+        for index in range(slot + 1, len(accounts) + 1, worker_plan.effective_concurrency):
+            account = accounts[index - 1]
+            with activate_worker(worker_plan.worker(index)) as worker:
+                print(
+                    f"[kiro] {index}/{len(accounts)} {account[0]} "
+                    f"worker={worker.worker_id} slot={worker.slot} "
+                    f"proxy={proxy_switch.current_node()}"
+                )
+                mailbox = account[4] if len(account) > 4 else None
+                output.append((index, account, register_one(*account[:4], args, mailbox=mailbox)))
+        return output
+
     success = 0
-    for index, account in enumerate(accounts, 1):
-        print(f"[kiro] {index}/{len(accounts)} {account[0]}")
-        result = register_one(*account, args)
-        if result["status"] == "success":
-            success += 1
-            email_pool.mark_used("kiro", account[0], account[1])
-            print(f"[kiro] success: {success}/{len(accounts)}")
-        else:
-            email_pool.mark_error("kiro", account[0], account[1], result.get("error", "failed"))
-            print(f"[kiro] failed: {result.get('error', 'unknown')}")
+    with ThreadPoolExecutor(max_workers=worker_plan.effective_concurrency) as pool:
+        futures = [
+            pool.submit(run_lane, slot)
+            for slot in range(worker_plan.effective_concurrency)
+        ]
+        for future in as_completed(futures):
+            for _index, account, result in future.result():
+                if result["status"] == "success":
+                    success += 1
+                    if len(account) == 4:
+                        email_pool.mark_used("kiro", account[0], account[1])
+                    print(f"[kiro] success: {success}/{len(accounts)}")
+                else:
+                    if len(account) == 4:
+                        email_pool.mark_error(
+                            "kiro", account[0], account[1], result.get("error", "failed")
+                        )
+                    print(f"[kiro] failed: {result.get('error', 'unknown')}")
     return 0 if success == len(accounts) else 1
 
 

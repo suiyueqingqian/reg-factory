@@ -50,8 +50,10 @@ def _env_int(name, default):
 
 
 # ---------------------------------------------------------------- 本地基建
-# Fingerprint browser provider: ruyipage / bundled / bitbrowser / adspower
-FINGERPRINT_BROWSER = _env("FINGERPRINT_BROWSER", "ruyipage").strip().lower()
+# Fingerprint browser provider: bitbrowser / bundled / custom / adspower /
+# custom_api / cloak / roxy.  cloak/roxy are the browser implementations used
+# by turb-gpt-free-register; they keep the existing Playwright registration flow.
+FINGERPRINT_BROWSER = _env("FINGERPRINT_BROWSER", "bitbrowser").strip().lower()
 
 # BitBrowser 本地 API 地址
 BITBROWSER_API = _env("BITBROWSER_API", "http://127.0.0.1:54345")
@@ -60,6 +62,77 @@ BITBROWSER_API = _env("BITBROWSER_API", "http://127.0.0.1:54345")
 ADSPOWER_API = _env("ADSPOWER_API", "http://127.0.0.1:50325")
 ADSPOWER_API_KEY = _env("ADSPOWER_API_KEY", "")
 ADSPOWER_GROUP_ID = _env("ADSPOWER_GROUP_ID", "0")
+
+# CloakBrowser (https://github.com/CloakHQ/CloakBrowser).  The async API is
+# launched in the same event loop as the current Playwright registration flow.
+CLOAK_HEADLESS = _env("CLOAK_HEADLESS", "true").strip().lower() in ("1", "true", "yes", "on")
+CLOAK_HUMANIZE = _env("CLOAK_HUMANIZE", "true").strip().lower() in ("1", "true", "yes", "on")
+CLOAK_GEOIP = _env("CLOAK_GEOIP", "true").strip().lower() in ("1", "true", "yes", "on")
+CLOAK_LOCALE = _env("CLOAK_LOCALE", "")
+CLOAK_TIMEZONE = _env("CLOAK_TIMEZONE", "")
+CLOAK_LICENSE_KEY = _env("CLOAK_LICENSE_KEY", "")
+CLOAK_FINGERPRINT_SEED = _env("CLOAK_FINGERPRINT_SEED", "")
+CLOAK_USER_DATA_DIR = _env("CLOAK_USER_DATA_DIR", "")
+CLOAK_EXTRA_ARGS = [item.strip() for item in _env("CLOAK_EXTRA_ARGS", "").replace(",", "\n").splitlines() if item.strip()]
+CLOAK_KEEP_BROWSER_OPEN = _env("CLOAK_KEEP_BROWSER_OPEN", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# RoxyBrowser local API.  Leave the workspace/profile fields empty until the
+# local Roxy installation supplies them; no external API is contacted unless
+# FINGERPRINT_BROWSER=roxy is selected.
+ROXY_API_BASE = _env("ROXY_API_BASE", "http://127.0.0.1:50100")
+ROXY_API_TOKEN = _env("ROXY_API_TOKEN", "")
+ROXY_PROFILE_ID = _env("ROXY_PROFILE_ID", "")
+ROXY_WORKSPACE_ID = _env("ROXY_WORKSPACE_ID", "")
+ROXY_PROJECT_ID = _env("ROXY_PROJECT_ID", "")
+ROXY_OPEN_PATH = _env("ROXY_OPEN_PATH", "/browser/open")
+ROXY_CLOSE_PATH = _env("ROXY_CLOSE_PATH", "/browser/close")
+ROXY_CREATE_PATH = _env("ROXY_CREATE_PATH", "/browser/create")
+ROXY_DELETE_PATH = _env("ROXY_DELETE_PATH", "/browser/delete")
+ROXY_OPEN_METHOD = _env("ROXY_OPEN_METHOD", "POST").upper()
+ROXY_CLOSE_METHOD = _env("ROXY_CLOSE_METHOD", "POST").upper()
+ROXY_CREATE_METHOD = _env("ROXY_CREATE_METHOD", "POST").upper()
+ROXY_DELETE_METHOD = _env("ROXY_DELETE_METHOD", "POST").upper()
+ROXY_OPEN_HEADLESS = _env("ROXY_OPEN_HEADLESS", "true").strip().lower() in ("1", "true", "yes", "on")
+ROXY_ONE_PROFILE_PER_ACCOUNT = _env("ROXY_ONE_PROFILE_PER_ACCOUNT", "true").strip().lower() in ("1", "true", "yes", "on")
+ROXY_DELETE_PROFILE_AFTER_RUN = _env("ROXY_DELETE_PROFILE_AFTER_RUN", "true").strip().lower() in ("1", "true", "yes", "on")
+ROXY_CREATE_USE_PROXY_POOL = _env("ROXY_CREATE_USE_PROXY_POOL", "true").strip().lower() in ("1", "true", "yes", "on")
+ROXY_RANDOM_OS_ON_CREATE = _env("ROXY_RANDOM_OS_ON_CREATE", "true").strip().lower() in ("1", "true", "yes", "on")
+ROXY_RANDOM_OS_CHOICES = _env("ROXY_RANDOM_OS_CHOICES", "Windows,macOS")
+ROXY_DEFAULT_OS = _env("ROXY_DEFAULT_OS", "macOS")
+ROXY_PROFILE_NAME_PREFIX = _env("ROXY_PROFILE_NAME_PREFIX", "reg")
+ROXY_KEEP_BROWSER_OPEN = _env("ROXY_KEEP_BROWSER_OPEN", "false").strip().lower() in ("1", "true", "yes", "on")
+ROXY_API_TIMEOUT = _env_int("ROXY_API_TIMEOUT", 90)
+ROXY_API_RETRIES = _env_int("ROXY_API_RETRIES", 3)
+
+# Custom fingerprint-browser API. `auto` preserves the legacy BitBrowser
+# payload; `generic` supports common REST APIs with configurable paths.
+CUSTOM_BROWSER_API = _env("CUSTOM_BROWSER_API", "")
+CUSTOM_BROWSER_API_MODE = _env("CUSTOM_BROWSER_API_MODE", "auto").strip().lower() or "auto"
+CUSTOM_BROWSER_API_KEY = _env("CUSTOM_BROWSER_API_KEY", "")
+CUSTOM_BROWSER_API_AUTH_HEADER = _env("CUSTOM_BROWSER_API_AUTH_HEADER", "Authorization")
+CUSTOM_BROWSER_API_AUTH_PREFIX = _env("CUSTOM_BROWSER_API_AUTH_PREFIX", "Bearer ")
+CUSTOM_BROWSER_API_HEADERS = _env("CUSTOM_BROWSER_API_HEADERS", "")
+CUSTOM_BROWSER_API_TIMEOUT = _env_int("CUSTOM_BROWSER_API_TIMEOUT", 60)
+CUSTOM_BROWSER_API_VERIFY_TLS = _env("CUSTOM_BROWSER_API_VERIFY_TLS", "true").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+CUSTOM_BROWSER_API_ID_FIELD = _env("CUSTOM_BROWSER_API_ID_FIELD", "id")
+CUSTOM_BROWSER_API_HEALTH_PATH = _env("CUSTOM_BROWSER_API_HEALTH_PATH", "/health")
+CUSTOM_BROWSER_API_CREATE_PATH = _env("CUSTOM_BROWSER_API_CREATE_PATH", "/browser/update")
+CUSTOM_BROWSER_API_LIST_PATH = _env("CUSTOM_BROWSER_API_LIST_PATH", "/browser/list")
+CUSTOM_BROWSER_API_OPEN_PATH = _env("CUSTOM_BROWSER_API_OPEN_PATH", "/browser/open")
+CUSTOM_BROWSER_API_CLOSE_PATH = _env("CUSTOM_BROWSER_API_CLOSE_PATH", "/browser/close")
+CUSTOM_BROWSER_API_DELETE_PATH = _env("CUSTOM_BROWSER_API_DELETE_PATH", "/browser/delete")
+CUSTOM_BROWSER_API_UPDATE_PATH = _env("CUSTOM_BROWSER_API_UPDATE_PATH", "/browser/update/partial")
+CUSTOM_BROWSER_API_CREATE_METHOD = _env("CUSTOM_BROWSER_API_CREATE_METHOD", "POST").upper()
+CUSTOM_BROWSER_API_LIST_METHOD = _env("CUSTOM_BROWSER_API_LIST_METHOD", "POST").upper()
+CUSTOM_BROWSER_API_OPEN_METHOD = _env("CUSTOM_BROWSER_API_OPEN_METHOD", "POST").upper()
+CUSTOM_BROWSER_API_CLOSE_METHOD = _env("CUSTOM_BROWSER_API_CLOSE_METHOD", "POST").upper()
+CUSTOM_BROWSER_API_DELETE_METHOD = _env("CUSTOM_BROWSER_API_DELETE_METHOD", "POST").upper()
+CUSTOM_BROWSER_API_UPDATE_METHOD = _env("CUSTOM_BROWSER_API_UPDATE_METHOD", "POST").upper()
+CUSTOM_BROWSER_API_FORWARD_FIELDS = _env("CUSTOM_BROWSER_API_FORWARD_FIELDS", "false").strip().lower() in (
+    "1", "true", "yes", "on"
+)
 
 # Claude.ai 注册相关 URL
 CLAUDE_LOGIN_URL = "https://claude.ai/login"
@@ -92,7 +165,7 @@ MAIL_NEW_PASS = _env("MAIL_NEW_PASS", "")
 GROK_USE_TEMP_EMAIL = _env("GROK_USE_TEMP_EMAIL", "false").strip().lower() in ("1", "true", "yes", "on")
 # CLAUDE_USE_TEMP_EMAIL=true 时 register.py 走临时邮箱取 magic link，免去 Outlook 注册/轮询。
 CLAUDE_USE_TEMP_EMAIL = _env("CLAUDE_USE_TEMP_EMAIL", "false").strip().lower() in ("1", "true", "yes", "on")
-# provider: moemail | yyds | gptmail | cfmail | icloud（默认 gptmail，带公共测试 key 开箱即用）
+# provider: moemail | yyds | gptmail | cfmail | icloud | remail（默认 gptmail）
 TEMP_EMAIL_PROVIDER = _env("TEMP_EMAIL_PROVIDER", "gptmail").strip().lower() or "gptmail"
 
 # Outlook Graph OAuth 遇到安全信息页时，绑定临时辅助邮箱并自动轮询验证码。
@@ -115,8 +188,18 @@ OUTLOOK_GRAPH_RECOVERY_POLL_INTERVAL = _env_int(
     "OUTLOOK_GRAPH_RECOVERY_POLL_INTERVAL", 5
 )
 
-# ChatGPT 邮箱来源：pool=emails.txt Outlook 池；icloud=自动申请 iCloud 地址并通过 API 取码。
+# ChatGPT 邮箱来源：pool=emails.txt Outlook 池；icloud/Remail=自动申请邮箱并通过 API 取码。
 CHATGPT_EMAIL_PROVIDER = _env("CHATGPT_EMAIL_PROVIDER", "pool").strip().lower() or "pool"
+CHATGPT_ENABLE_2FA = _env("CHATGPT_ENABLE_2FA", "true").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+# ChatGPT 验证码提交后，邮箱 API 的最长等待和轮询间隔。
+CHATGPT_VERIFICATION_CODE_TIMEOUT = _env_int(
+    "CHATGPT_VERIFICATION_CODE_TIMEOUT", 90
+)
+CHATGPT_VERIFICATION_POLL_INTERVAL = _env_int(
+    "CHATGPT_VERIFICATION_POLL_INTERVAL", 5
+)
 
 # MoeMail（beilunyang/moemail，需自部署）
 MOEMAIL_BASE_URL = _env("MOEMAIL_BASE_URL", "https://moemail.example.com")
@@ -131,6 +214,13 @@ YYDS_API_KEY = _env("YYDS_API_KEY", "")  # AC-... 格式，profile 页获取
 # GPTMail（mail.chatgpt.org.uk），支持公共测试 key "gpt-test"
 GPTMAIL_BASE_URL = _env("GPTMAIL_BASE_URL", "https://mail.chatgpt.org.uk")
 GPTMAIL_API_KEY = _env("GPTMAIL_API_KEY", "gpt-test")
+
+# Remail 开放 API（Bearer rk-...；短效验证码订单）
+REMAIL_BASE_URL = _env("REMAIL_BASE_URL", "https://remail.aishop6.com")
+REMAIL_API_KEY = _env("REMAIL_API_KEY", "")
+REMAIL_PROJECT_ID = _env_int("REMAIL_PROJECT_ID", 0)
+REMAIL_EMAIL_SUFFIX = _env("REMAIL_EMAIL_SUFFIX", "outlook.com")
+REMAIL_SUPPLY = _env("REMAIL_SUPPLY", "private_first")
 
 # iCloud Mail API（API 主机，不是文档站 email.manageh.shop）
 ICLOUD_MAIL_API_BASE = _env("ICLOUD_MAIL_API_BASE", "https://mail.no-replyca.xyz")
@@ -220,6 +310,10 @@ TOKEN_OUTPUT_DIR = _env("TOKEN_OUTPUT_DIR", "tokens")
 # CPA 管理接口（ChatGPT codex 授权文件导入）
 CPA_URL = _env("CPA_URL", "")
 CPA_MGMT_KEY = _env("CPA_MGMT_KEY", "")
+# Codex 授权地址来源：sub2 保持旧流程；cpa 由 CPA 生成 PKCE 并接收 callback。
+CODEX_AUTH_URL_SOURCE = _env("CODEX_AUTH_URL_SOURCE", "sub2").strip().lower() or "sub2"
+CODEX_CPA_CALLBACK_RETRIES = int(_env("CODEX_CPA_CALLBACK_RETRIES", "5") or "5")
+CODEX_CPA_CALLBACK_RETRY_DELAY = float(_env("CODEX_CPA_CALLBACK_RETRY_DELAY", "3") or "3")
 
 # SUB2API 管理接口（ChatGPT codex-session / Grok SSO 转 OAuth 导入）
 SUB2API_URL = _env("SUB2API_URL", "")
@@ -248,8 +342,8 @@ GROK_SUB_CDK = [c.strip() for c in _env("GROK_SUB_CDK", "").replace("\n", ",").r
 
 # ---------------------------------------------------------------- ChatGPT OAuth add-phone 接码
 # OpenAI/ChatGPT 在接码平台的服务号（按平台分，跟 Claude 的不同）
-SMS_PROJECT_ID_OPENAI = _env("SMS_PROJECT_ID_OPENAI", "")  # firefox.fun 的 ChatGPT 项目 iid（待填）
-HERO_SMS_SERVICE_OPENAI = _env("HERO_SMS_SERVICE_OPENAI", "dr")  # hero-sms/sms-activate OpenAI 服务码默认 dr
+SMS_PROJECT_ID_OPENAI = _env("SMS_PROJECT_ID_OPENAI", "1096")  # firefox.fun 的 ChatGPT 项目 iid
+HERO_SMS_SERVICE_OPENAI = _env("HERO_SMS_SERVICE_OPENAI", "wa")  # Hero SMS 实际服务标识，不使用 chatgpt/openai
 # firefox.fun 价格上限：'0' 只取最便宜(垃圾号易被 OpenAI 拒)，给够才摸得到智利等好号
 SMS_MAXPRICE_OPENAI = _env("SMS_MAXPRICE_OPENAI", "20")
 # OpenAI add-phone 拉黑的号段(dialing code)：261 马达加斯加、63 菲律宾 等 OpenAI 常拒的

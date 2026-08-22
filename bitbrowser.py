@@ -23,7 +23,7 @@ def _selected_provider():
         os.environ.get("FINGERPRINT_BROWSER")
         or os.environ.get("BROWSER_PROVIDER")
         or FINGERPRINT_BROWSER
-        or "ruyipage"
+        or "bitbrowser"
     ).strip().lower()
 
 
@@ -41,17 +41,19 @@ class BitBrowser:
 
     def __new__(cls, api_base=None):
         if cls is BitBrowser and _selected_provider() in {
-            "ruyipage", "ruyi", "firefox_bidi",
-        }:
-            # Legacy flows still call Playwright Chromium CDP directly. They use
-            # the local Chromium adapter until they migrate to the shared layer.
-            from common.bundled_browser import BundledBrowser
-            return BundledBrowser(api_base=api_base)
-        if cls is BitBrowser and _selected_provider() in {
             "bundled", "embedded", "local", "custom", "chrome", "chromium",
         }:
             from common.bundled_browser import BundledBrowser
             return BundledBrowser(api_base=api_base)
+        if cls is BitBrowser and _selected_provider() in {"custom_api", "api"}:
+            from common.custom_browser_api import CustomBrowserAPI
+            return CustomBrowserAPI(api_base=api_base)
+        # CloakBrowser is selected and launched by common.browser inside the
+        # active async Playwright loop.  Keep direct legacy BitBrowser callers
+        # on the BitBrowser contract instead of returning an async-only handle.
+        if cls is BitBrowser and _selected_provider() in {"roxy", "roxybrowser"}:
+            from common.roxy_browser import RoxyBrowser
+            return RoxyBrowser(api_base=api_base)
         if cls is BitBrowser and _use_adspower():
             from adspower import AdsPower
             return AdsPower(api_base=api_base)
@@ -97,7 +99,16 @@ class BitBrowser:
         打开浏览器窗口，返回 WebSocket 调试地址
         返回: {"ws": "ws://...", "http": "http://..."}
         """
-        result = self._post("/browser/open", {"id": profile_id})
+        from common.traffic_saver import bitbrowser_open_payload
+
+        payload = bitbrowser_open_payload(profile_id)
+        try:
+            result = self._post("/browser/open", payload)
+        except Exception:
+            if "args" not in payload:
+                raise
+            print("  BitBrowser rejected traffic-saving launch args; retrying normally")
+            result = self._post("/browser/open", {"id": profile_id})
         return result["data"]
 
     def update_browser_fingerprint(self, profile_id, **fingerprint):
@@ -117,6 +128,11 @@ class BitBrowser:
     def delete_browser(self, profile_id):
         """删除浏览器窗口配置"""
         result = self._post("/browser/delete", {"id": profile_id})
+        try:
+            from common.browser_registry import unregister
+            unregister(profile_id)
+        except Exception:
+            pass
         print(f"  窗口已删除: {profile_id}")
         return result
 
@@ -151,6 +167,8 @@ class BitBrowser:
         创建新的浏览器窗口配置
         返回创建的窗口 ID
         """
+        from common.traffic_saver import bitbrowser_profile_defaults
+
         data = {
             "name": name,
             "remark": "claude.ai 自动注册",
@@ -159,10 +177,21 @@ class BitBrowser:
             "browserFingerPrint": {
                 "coreVersion": "130",
             },
+            **bitbrowser_profile_defaults(),
             **kwargs,
         }
         result = self._post("/browser/update", data)
         profile_id = result["data"]["id"]
+        try:
+            from common.browser_registry import register
+            register(
+                profile_id,
+                name=name,
+                provider=self.provider_name,
+                api_base=self.api_base,
+            )
+        except Exception as exc:
+            print(f"  profile registry warning: {str(exc)[:120]}")
         print(f"  新窗口已创建: {name} (ID: {profile_id})")
         return profile_id
 

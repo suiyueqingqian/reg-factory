@@ -12,6 +12,7 @@ ChatGPT (OpenAI) 自动注册
 
 import argparse
 import asyncio
+import contextvars
 import functools
 import json
 import os as _os
@@ -34,22 +35,28 @@ from common.cookies import save_platform_cookies
 from common import emails as email_pool
 from common.temp_email import create_mailbox, poll_verification_code
 from common import proxy_switch
+from common import node_quarantine
 
 try:
-    from config import CHATGPT2API_URL, CHATGPT2API_KEY, CHATGPT_EMAIL_PROVIDER
+    from config import (
+        CHATGPT2API_URL, CHATGPT2API_KEY, CHATGPT_EMAIL_PROVIDER,
+        CHATGPT_ENABLE_2FA,
+    )
 except Exception:
     CHATGPT2API_URL, CHATGPT2API_KEY = "", ""
     CHATGPT_EMAIL_PROVIDER = "pool"
+    CHATGPT_ENABLE_2FA = True
 
 try:
     from config import (
         SUB2API_URL, SUB2API_EMAIL, SUB2API_PASSWORD, SUB2API_GROUP,
-        CPA_URL, CPA_MGMT_KEY,
+        CPA_URL, CPA_MGMT_KEY, CODEX_AUTH_URL_SOURCE,
     )
 except Exception:
     SUB2API_URL = SUB2API_EMAIL = SUB2API_PASSWORD = ""
     SUB2API_GROUP = "codex"
     CPA_URL = CPA_MGMT_KEY = ""
+    CODEX_AUTH_URL_SOURCE = "sub2"
 
 PLATFORM = "chatgpt"
 SIGNUP_URL = "https://chatgpt.com/auth/login"
@@ -66,12 +73,86 @@ PLUS_SUBSCRIPTION = False  # 注册成功后加入本地 Plus 订阅工作台
 C2A_URL = None  # chatgpt2api host（默认取 config.CHATGPT2API_URL）
 C2A_KEY = None  # chatgpt2api admin key（默认取 config.CHATGPT2API_KEY）
 EXTRACT_CODEX = False  # 注册成功后顺手走 Codex OAuth 提取 rt 导入 SUB2API（--codex 开启）
+ENABLE_2FA = CHATGPT_ENABLE_2FA
 CODEX_GROUP = None  # SUB2API 目标分组（默认取 config.SUB2API_GROUP）
 CODEX_MANUAL_PHONE = False  # add-phone 手动模式（不接码，自己在浏览器填号收码）
-CODEX_SMS_PROVIDER = "auto"  # auto / smsman / firefox / hero
+CODEX_SMS_PROVIDER = "auto"  # auto / custom / smsman / firefox / hero
+CODEX_PHONE = ""
 CODEX_TIMEOUT = 120  # Codex 授权捕获超时秒
 CHATGPT_NODE = "auto"
+CHATGPT_COUNTRY = "auto"
 ACTIVE_CHATGPT_NODE = None
+ACTIVE_CHATGPT_COUNTRY = None
+_ACTIVE_CHATGPT_NODE_TASK = contextvars.ContextVar(
+    "chatgpt_active_node", default=None
+)
+_ACTIVE_CHATGPT_COUNTRY_TASK = contextvars.ContextVar(
+    "chatgpt_active_country", default=None
+)
+
+
+def _set_active_chatgpt_node(value):
+    global ACTIVE_CHATGPT_NODE
+    from common.task_context import active_worker
+
+    if active_worker():
+        _ACTIVE_CHATGPT_NODE_TASK.set(value)
+    else:
+        ACTIVE_CHATGPT_NODE = value
+
+
+def _get_active_chatgpt_node():
+    from common.task_context import active_worker
+
+    return _ACTIVE_CHATGPT_NODE_TASK.get() if active_worker() else ACTIVE_CHATGPT_NODE
+
+
+def _normalize_chatgpt_country(value):
+    country = str(value or "auto").strip().upper()
+    if country in {"", "AUTO", "ANY"}:
+        return "auto"
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        raise ValueError("ChatGPT country must be auto or a two-letter ISO code")
+    return country
+
+
+def _set_active_chatgpt_country(value):
+    global ACTIVE_CHATGPT_COUNTRY
+    from common.task_context import active_worker
+
+    country = _normalize_chatgpt_country(value) if value else None
+    if active_worker():
+        _ACTIVE_CHATGPT_COUNTRY_TASK.set(country)
+    else:
+        ACTIVE_CHATGPT_COUNTRY = country
+
+
+def _get_active_chatgpt_country():
+    from common.task_context import active_worker
+
+    return (
+        _ACTIVE_CHATGPT_COUNTRY_TASK.get()
+        if active_worker()
+        else ACTIVE_CHATGPT_COUNTRY
+    )
+
+
+def _chatgpt_country_matches(actual, requested):
+    target = _normalize_chatgpt_country(requested)
+    actual_country = str(actual or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", actual_country):
+        return False
+    return target == "auto" or actual_country == target
+
+
+def _chatgpt_probe_can_defer_to_browser(ok, loc, status, requested):
+    """Let the real browser handle a CF 403 when no country is pinned."""
+    return (
+        not ok
+        and status == 403
+        and _normalize_chatgpt_country(requested) == "auto"
+        and _chatgpt_country_matches(loc, "auto")
+    )
 
 
 def _env_int(name, default):
@@ -170,6 +251,9 @@ def _chatgpt_node_candidates():
     """Resolve and cache the candidate pool shared by preflight and CF rotation."""
     global _active_cf_nodes
     if _active_cf_nodes:
+        _active_cf_nodes = node_quarantine.filter_nodes(_active_cf_nodes)
+        if not _active_cf_nodes:
+            raise RuntimeError("no usable ChatGPT nodes: all candidates are temporarily tainted")
         return list(_active_cf_nodes)
 
     from common import proxy_switch
@@ -180,8 +264,10 @@ def _chatgpt_node_candidates():
 
     candidates = list(CF_NODES) if CF_NODES else _discover_chatgpt_nodes()
     limit = max(1, _env_int("CHATGPT_NODE_PROBE_LIMIT", 12))
-    _active_cf_nodes = candidates[:limit]
+    _active_cf_nodes = node_quarantine.filter_nodes(candidates[:limit])
     _cf_node_idx[0] = 0
+    if not _active_cf_nodes:
+        raise RuntimeError("no usable ChatGPT nodes: all candidates are temporarily tainted")
     return list(_active_cf_nodes)
 
 
@@ -227,8 +313,10 @@ async def _click_turnstile(page):
 
 def _activate_cf_node(node):
     """切换 Clash 节点并断开旧连接，避免新注册会话沿用旧出口。"""
-    global ACTIVE_CHATGPT_NODE
     try:
+        if node_quarantine.is_tainted(node):
+            print(f"  [node] skip temporarily tainted ChatGPT node: {node}")
+            return None
         from common import proxy_switch
         import _clash_verge as cv
         api = _os.environ.get("CLASH_API", "http://127.0.0.1:9097")
@@ -238,11 +326,30 @@ def _activate_cf_node(node):
         proxy_switch.set_node(active, group)
         client = cv.ClashClient(api, secret)
         client.close_connections()
-        ACTIVE_CHATGPT_NODE = active
+        _set_active_chatgpt_node(active)
         return active
     except Exception as e:
         print(f"  [cf] 切节点失败: {str(e)[:80]}")
         return None
+
+
+def _taint_active_chatgpt_node(reason):
+    """Persist a short cooldown for the route that triggered a browser risk page."""
+    node = _get_active_chatgpt_node()
+    if not node:
+        try:
+            node = proxy_switch.current_node()
+        except Exception:
+            node = None
+    if not node or str(node).lower() in {"direct", "residential"}:
+        return None
+    record = node_quarantine.taint(node, reason=reason)
+    if record:
+        print(
+            f"  [node] tainted for {int(record['expires_at'] - time.time())}s: "
+            f"{record['node']} ({record['reason']})"
+        )
+    return record
 
 
 def _switch_cf_node():
@@ -251,14 +358,53 @@ def _switch_cf_node():
     if proxy_switch.proxy_mode() == "residential":
         result = proxy_switch.rotate_proxy()
         if result.get("ok"):
-            global ACTIVE_CHATGPT_NODE
-            ACTIVE_CHATGPT_NODE = proxy_switch.current_node()
-            return ACTIVE_CHATGPT_NODE
+            if result.get("requires_new_session"):
+                print("  [cf] 任务代理已轮换；当前浏览器仍绑定旧端点，需要新建 Profile")
+                return None
+            active = proxy_switch.current_node()
+            _set_active_chatgpt_node(active)
+            return active
         return None
     candidates = _chatgpt_node_candidates()
-    node = candidates[_cf_node_idx[0] % len(candidates)]
-    _cf_node_idx[0] += 1
-    return _activate_cf_node(node)
+    requested_country = CHATGPT_COUNTRY
+    for _ in range(len(candidates)):
+        node = candidates[_cf_node_idx[0] % len(candidates)]
+        _cf_node_idx[0] += 1
+        if not _activate_cf_node(node):
+            continue
+        time.sleep(2)
+        try:
+            ok, loc, status = _probe_chatgpt_node()
+            matched = ok and _chatgpt_country_matches(loc, requested_country)
+            print(
+                f"  [node] ChatGPT rotate {node}: HTTP {status} loc={loc} "
+                f"{'PASS' if matched else 'SKIP'}"
+            )
+            if matched:
+                _set_active_chatgpt_country(loc)
+                return node
+        except Exception as exc:
+            print(f"  [node] ChatGPT rotate {node}: {str(exc)[:80]}")
+    return None
+
+
+def _switch_cf_node_with_state():
+    """Return task-local routing state across an asyncio.to_thread boundary."""
+    node = _switch_cf_node()
+    return node, _get_active_chatgpt_country()
+
+
+async def _rotate_chatgpt_auto_node():
+    """Rotate an auto Clash route and restore task-local state in this task."""
+    requested = str(CHATGPT_NODE or "auto").strip().lower()
+    if proxy_switch.proxy_mode() != "clash_auto" or requested != "auto":
+        return None
+    node, country = await asyncio.to_thread(_switch_cf_node_with_state)
+    if node:
+        _set_active_chatgpt_node(node)
+        if country:
+            _set_active_chatgpt_country(country)
+    return node
 
 
 def clash_browser_proxy_fields():
@@ -267,14 +413,34 @@ def clash_browser_proxy_fields():
     return proxy_switch.browser_proxy_fields()
 
 
-def _probe_chatgpt_node():
+def chatgpt_browser_proxy_fields():
+    if (CHATGPT_NODE or "auto").strip().lower() in {"none", "off", "direct"}:
+        return {"proxyMethod": 1, "proxyType": "noproxy"}
+    return clash_browser_proxy_fields()
+
+
+def chatgpt_network_label():
+    if (CHATGPT_NODE or "auto").strip().lower() in {"none", "off", "direct"}:
+        return "direct"
+    active = _get_active_chatgpt_node()
+    if active:
+        return str(active)
+    try:
+        return str(proxy_switch.current_node() or "")
+    except Exception:
+        return ""
+
+
+def _probe_chatgpt_node(direct=False):
     """验证当前 Clash 出口能访问 ChatGPT，并返回 Cloudflare 识别地区。"""
     from curl_cffi import requests as creq
 
     from common import proxy_switch
-    proxy = proxy_switch.effective_proxy_url()
+    proxy = "" if direct else proxy_switch.effective_proxy_url()
     session = creq.Session(impersonate="chrome131", http_version="v2")
-    session.proxies = {"http": proxy, "https": proxy}
+    session.trust_env = False
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
     try:
         trace = session.get("https://auth.openai.com/cdn-cgi/trace", timeout=15)
         loc = next(
@@ -294,21 +460,59 @@ def _probe_chatgpt_node():
         session.close()
 
 
-def select_chatgpt_node(requested, allow_blocked=False):
+def select_chatgpt_node(requested, allow_blocked=False, country="auto"):
     """注册开始前选定一个节点；账号会话建立后不再静默换出口。"""
     global ACTIVE_CHATGPT_NODE
     value = (requested or "auto").strip()
+    requested_country = _normalize_chatgpt_country(country)
+    _set_active_chatgpt_country(None)
     from common import proxy_switch
     mode = proxy_switch.proxy_mode()
-    if mode in {"residential", "direct"} and value.lower() == "auto":
-        ACTIVE_CHATGPT_NODE = None
-        print("  [node] ChatGPT 使用直连住宅代理，跳过 Clash 节点探测")
+    explicit_direct = value.lower() in {"none", "off", "direct"}
+    if mode == "direct" or explicit_direct:
+        ok, loc, status = _probe_chatgpt_node(direct=True)
+        if not ok or not _chatgpt_country_matches(loc, requested_country):
+            raise RuntimeError(
+                f"direct exit country mismatch: requested={requested_country}, "
+                f"actual={loc}, HTTP {status}"
+            )
+        _set_active_chatgpt_country(loc)
+        _set_active_chatgpt_node(None)
+        print(f"  [node] ChatGPT direct exit verified: {loc}")
         return None
-    if value.lower() in {"none", "off", "direct"}:
-        ACTIVE_CHATGPT_NODE = None
-        print("  [node] ChatGPT 使用直连模式")
-        return None
-
+    if mode == "residential" and value.lower() == "auto":
+        retries = max(1, _env_int("CHATGPT_RESIDENTIAL_ROTATE_RETRIES", 3))
+        last = ""
+        for attempt in range(retries):
+            try:
+                ok, loc, status = _probe_chatgpt_node()
+                last = f"loc={loc} HTTP {status}"
+                if ok and _chatgpt_country_matches(loc, requested_country):
+                    _set_active_chatgpt_country(loc)
+                    _set_active_chatgpt_node(None)
+                    print(f"  [node] ChatGPT residential exit verified: {loc}")
+                    return None
+                if _chatgpt_probe_can_defer_to_browser(
+                    ok, loc, status, requested_country
+                ):
+                    _set_active_chatgpt_country(loc)
+                    _set_active_chatgpt_node(None)
+                    print(
+                        "  [node] ChatGPT residential preflight HTTP 403 "
+                        f"(loc={loc}); auto country defers challenge to browser"
+                    )
+                    return None
+            except Exception as exc:
+                last = str(exc)
+            if attempt + 1 < retries:
+                result = proxy_switch.rotate_proxy()
+                print(
+                    f"  [node] residential country mismatch; rotate "
+                    f"({attempt + 1}/{retries}): {result.get('node') or 'failed'}"
+                )
+        raise RuntimeError(
+            f"no residential exit matched country {requested_country}: {last}"
+        )
     if mode == "clash_fixed":
         fixed = proxy_switch.fixed_node()
         if not fixed:
@@ -329,36 +533,153 @@ def select_chatgpt_node(requested, allow_blocked=False):
         time.sleep(2)
         try:
             ok, loc, status = _probe_chatgpt_node()
-            print(f"  [node] ChatGPT probe {node}: HTTP {status} loc={loc} {'PASS' if ok else 'BLOCK'}")
-            if ok:
+            country_ok = _chatgpt_country_matches(loc, requested_country)
+            outcome = "PASS" if ok and country_ok else "COUNTRY" if ok else "BLOCK"
+            print(f"  [node] ChatGPT probe {node}: HTTP {status} loc={loc} {outcome}")
+            if ok and country_ok:
                 _cf_node_idx[0] = index + 1
+                _set_active_chatgpt_country(loc)
                 return node
         except Exception as e:
             last_error = str(e)
             print(f"  [node] ChatGPT probe {node}: {last_error[:80]}")
-    if allow_blocked and activated:
+    if allow_blocked and activated and requested_country == "auto":
         fallback = activated[0]
         _activate_cf_node(fallback)
         print(f"  [node] 无 Cookie 预检均被拦，OAuth 使用已有登录态继续验证: {fallback}")
         return fallback
-    raise RuntimeError(f"没有可用的 ChatGPT 节点: {last_error or value}")
+    country_note = "" if requested_country == "auto" else f" country={requested_country}"
+    raise RuntimeError(f"no usable ChatGPT node{country_note}: {last_error or value}")
+
+
+def ensure_chatgpt_worker_country():
+    """Verify a worker's final proxy before its browser profile is created."""
+    requested = _normalize_chatgpt_country(CHATGPT_COUNTRY)
+    from common import proxy_switch
+
+    mode = proxy_switch.proxy_mode()
+    explicit_direct = (CHATGPT_NODE or "auto").strip().lower() in {
+        "none",
+        "off",
+        "direct",
+    }
+    attempts = (
+        max(1, _env_int("CHATGPT_RESIDENTIAL_ROTATE_RETRIES", 3))
+        if mode == "residential" and not explicit_direct
+        else 1
+    )
+    last = ""
+    for attempt in range(attempts):
+        ok, loc, status = _probe_chatgpt_node(
+            direct=explicit_direct or mode == "direct"
+        )
+        last = f"loc={loc} HTTP {status}"
+        if ok and _chatgpt_country_matches(loc, requested):
+            _set_active_chatgpt_country(loc)
+            return loc
+        if _chatgpt_probe_can_defer_to_browser(ok, loc, status, requested):
+            _set_active_chatgpt_country(loc)
+            print(
+                "  [node] ChatGPT worker preflight HTTP 403 "
+                f"(loc={loc}); auto country defers challenge to browser"
+            )
+            return loc
+        if explicit_direct or mode != "residential" or attempt + 1 >= attempts:
+            break
+        result = proxy_switch.rotate_proxy()
+        if not result.get("ok") or not result.get("changed"):
+            break
+    raise RuntimeError(f"worker exit did not match country {requested}: {last}")
 
 
 def assert_chatgpt_node(stage):
     """检测其他任务是否在注册中途改了 GLOBAL 出口。"""
-    if not ACTIVE_CHATGPT_NODE:
+    expected = _get_active_chatgpt_node()
+    if not expected:
         return
     from common import proxy_switch
 
     current = proxy_switch.current_node()
-    if current != ACTIVE_CHATGPT_NODE:
+    if current != expected:
         raise RuntimeError(
-            f"chatgpt_node_changed:{stage}: expected={ACTIVE_CHATGPT_NODE}, current={current}"
+            f"chatgpt_node_changed:{stage}: expected={expected}, current={current}"
         )
 
 
 class OnboardingRejected(RuntimeError):
     pass
+
+
+class EmailVerificationRetryNeeded(RuntimeError):
+    pass
+
+
+def _classify_chatgpt_password_step(
+    url: str = "",
+    body: str = "",
+    autocomplete: str = "",
+    input_name: str = "",
+) -> str:
+    """Classify a visible OpenAI password form without relying on its locale.
+
+    The signup flow currently has both ``create-account/password`` and
+    ``log-in/password`` variants.  A password input by itself is ambiguous,
+    especially while the SPA keeps the previous form mounted, so explicit
+    route/autocomplete/login copy wins over the signup fallback.
+    """
+    haystack = " ".join(
+        str(value or "").strip().lower()
+        for value in (url, body, autocomplete, input_name)
+    )
+    login_markers = (
+        "/log-in/password",
+        "/login/password",
+        "current-password",
+        "sign in to your account",
+        "sign in to chatgpt",
+        "登录你的账户",
+        "登入你的帳戶",
+        "se connecter",
+    )
+    if any(marker in haystack for marker in login_markers):
+        return "login"
+    return "create"
+
+
+async def detect_chatgpt_password_step(page) -> str:
+    """Return ``create``, ``login`` or ``none`` for the visible password step."""
+    try:
+        locator = page.locator(
+            'input[type="password"], input[name="password"], '
+            'input[name="new-password"]'
+        )
+        count = await locator.count()
+        visible = None
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible():
+                    visible = candidate
+                    break
+            except Exception:
+                continue
+        if visible is None:
+            return "none"
+        attrs = []
+        for name in ("autocomplete", "name", "placeholder", "aria-label"):
+            try:
+                attrs.append(await visible.get_attribute(name) or "")
+            except Exception:
+                attrs.append("")
+        try:
+            body = await page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            body = ""
+        return _classify_chatgpt_password_step(
+            getattr(page, "url", ""), body, attrs[0], " ".join(attrs[1:])
+        )
+    except Exception:
+        return "none"
 
 
 def _openai_error_from_text(text, status=0, url=""):
@@ -395,24 +716,171 @@ def _openai_error_from_text(text, status=0, url=""):
     return {"code": f"http_{status}", "message": raw[:180], "status": status, "url": url}
 
 
+def _is_chatgpt_auth_script(url):
+    try:
+        parsed = urlsplit(str(url or ""))
+        return (
+            parsed.hostname == "chatgpt.com"
+            and parsed.path.startswith("/cdn/assets/")
+            and parsed.path.endswith(".js")
+        )
+    except Exception:
+        return False
+
+
+class ChatGPTAuthAssetMonitor:
+    """Track whether the server-rendered login shell actually loaded its JS."""
+
+    def __init__(self):
+        self.loaded = set()
+        self.failed = []
+
+    def observe_response(self, response):
+        if not _is_chatgpt_auth_script(response.url):
+            return
+        if response.status < 400:
+            self.loaded.add(urlsplit(response.url).path)
+        else:
+            self.failed.append(f"HTTP {response.status}")
+
+    def observe_failure(self, request):
+        if _is_chatgpt_auth_script(request.url):
+            self.failed.append(str(request.failure or "request failed")[:80])
+
+    def attach(self, page):
+        page.on("response", self.observe_response)
+        page.on("requestfailed", self.observe_failure)
+
+
+async def _chatgpt_email_form_hydrated(page):
+    """Check that React attached handlers to the server-rendered login form."""
+    try:
+        button = page.locator('button[type="submit"]').first
+        if await button.count() == 0:
+            button = page.get_by_role("button", name="Continue", exact=True).first
+        if await button.count() == 0:
+            return False
+        return bool(
+            await button.evaluate(
+                """element => {
+                    const nodes = [
+                        element,
+                        element.form,
+                        element.closest('[data-reactroot], #root, #__next'),
+                        document.body,
+                        document.documentElement,
+                    ].filter(Boolean);
+                    return nodes.some(node => Object.getOwnPropertyNames(node).some(key =>
+                        key.startsWith('__reactProps$') ||
+                        key.startsWith('__reactFiber$') ||
+                        key.startsWith('__reactContainer$') ||
+                        key.startsWith('_reactListening')
+                    ));
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def wait_for_chatgpt_auth_assets(page, monitor, timeout=12, fallback_after=2):
+    """Require loaded auth bundles and a hydrated form before interacting."""
+    deadline = time.monotonic() + max(1, timeout)
+    rendered_ready_since = None
+    while time.monotonic() < deadline:
+        if len(monitor.failed) >= 3:
+            return False
+        if monitor.loaded:
+            try:
+                email = page.locator('input[type="email"], input[name="email"]').first
+                email_visible = await email.count() > 0 and await email.is_visible()
+                if email_visible:
+                    if await _chatgpt_email_form_hydrated(page):
+                        return True
+                    if rendered_ready_since is None:
+                        rendered_ready_since = time.monotonic()
+                    elif (
+                        not monitor.failed
+                        and time.monotonic() - rendered_ready_since >= max(0, fallback_after)
+                    ):
+                        print(
+                            "  [1] React marker unavailable; "
+                            "loaded auth JS and visible email form accepted"
+                        )
+                        return True
+                else:
+                    rendered_ready_since = None
+            except Exception:
+                pass
+        await asyncio.sleep(0.4)
+    return False
+
+
+async def _try_pass_chatgpt_turnstile(page, rounds=4, wait=4):
+    for _ in range(rounds):
+        if not await _is_cf_blocked(page):
+            return True
+        await _click_turnstile(page)
+        await asyncio.sleep(wait)
+    return not await _is_cf_blocked(page)
+
+
 class AuthResponseMonitor:
-    """Collect failed auth POST responses without printing tokens or query strings."""
+    """Collect auth failures without printing tokens or query strings.
+
+    ``CHATGPT_DEBUG_AUTH=1`` additionally records redacted request events. This
+    is opt-in because a stalled SPA hand-off can fail during a GET/navigation.
+    """
 
     def __init__(self):
         self.errors = []
         self._tasks = []
+        self.debug = str(_os.environ.get("CHATGPT_DEBUG_AUTH", "")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        self.events = []
+        self.failures = []
 
     def observe(self, response):
         try:
             parsed = urlsplit(response.url)
-            if response.request.method.upper() != "POST" or parsed.hostname != "auth.openai.com":
+            hostname = (parsed.hostname or "").lower()
+            if hostname not in {"auth.openai.com", "chatgpt.com"}:
+                return
+            method = response.request.method.upper()
+            if self.debug and len(self.events) < 160:
+                path = parsed.path or "/"
+                if hostname == "auth.openai.com" or path.startswith(("/auth", "/api")):
+                    self.events.append(f"{method} {hostname}{path} -> {response.status}")
+            if method != "POST" or hostname != "auth.openai.com":
                 return
             if not any(
                 marker in parsed.path.lower()
-                for marker in ("account", "onboarding", "about-you", "email-verification")
+                for marker in (
+                    "account", "onboarding", "about-you", "email-verification",
+                    "verification", "verify",
+                )
             ):
                 return
             self._tasks.append(asyncio.create_task(self._record(response, parsed.path)))
+        except Exception:
+            pass
+
+    def observe_failure(self, request):
+        if not self.debug:
+            return
+        try:
+            parsed = urlsplit(request.url)
+            hostname = (parsed.hostname or "").lower()
+            if hostname not in {"auth.openai.com", "chatgpt.com"}:
+                return
+            path = parsed.path or "/"
+            if hostname == "auth.openai.com" or path.startswith(("/auth", "/api")):
+                failure = str(request.failure or "request failed")[:120]
+                if len(self.failures) < 80:
+                    self.failures.append(
+                        f"{request.method.upper()} {hostname}{path} !! {failure}"
+                    )
         except Exception:
             pass
 
@@ -439,6 +907,23 @@ class AuthResponseMonitor:
         return self.errors[-1] if self.errors else None
 
 
+    async def debug_summary(self):
+        await self._drain()
+        if not self.debug:
+            return ""
+        parts = []
+        if self.events:
+            parts.append("responses=" + " | ".join(self.events[-24:]))
+        if self.failures:
+            parts.append("failed=" + " | ".join(self.failures[-12:]))
+        if self.errors:
+            parts.append("auth_errors=" + " | ".join(
+                f"{e.get('code')}:{e.get('status')}:{e.get('url')}"
+                for e in self.errors[-4:]
+            ))
+        return " ; ".join(parts) or "no auth requests observed"
+
+
 async def is_email_verification_route_error(page):
     """Detect the auth UI error returned when a JSON route responds with HTML."""
     try:
@@ -450,36 +935,177 @@ async def is_email_verification_route_error(page):
     )
 
 
+async def email_verification_succeeded(page):
+    """Recognize accepted-code screens that remain on the verification URL."""
+    current_url = (page.url or "").lower()
+    if any(marker in current_url for marker in ("about-you", "onboarding")):
+        return True
+    if "chatgpt.com" in current_url and "/auth/" not in current_url:
+        return True
+    try:
+        body = (await page.locator("body").inner_text(timeout=2500)).strip().lower()
+    except Exception:
+        return False
+    return any(marker in body for marker in (
+        "email verified",
+        "email has already been verified",
+        "email has been verified",
+        "email berhasil diverifikasi",
+        "email telah diverifikasi",
+        "邮箱已验证",
+        "郵箱已驗證",
+        "メールアドレスは確認済み",
+    ))
+
+
+async def _email_verification_ui_hint(page):
+    """Return a short, non-sensitive rejection hint rendered by the auth UI."""
+    try:
+        body = (await page.locator("body").inner_text(timeout=1500)).strip()
+    except Exception:
+        return ""
+    markers = (
+        "invalid", "expired", "incorrect", "try again", "too many",
+        "code is not", "doesn't match", "not valid", "验证码无效", "验证码错误",
+        "过期", "正しくありません", "期限切れ",
+    )
+    lines = [" ".join(line.split()) for line in body.splitlines()]
+    for line in lines:
+        lowered = line.lower()
+        if line and any(marker.lower() in lowered for marker in markers):
+            return line[:180]
+    return ""
+
+
+async def _wait_for_email_verification_result(page):
+    """Give the SPA time to commit before classifying the form as stuck."""
+    # Auth pages can remount the form and change locale after submit. Sampling
+    # in short intervals avoids treating that transient state as a rejection.
+    for delay in (0, 0.75, 1.5, 3, 5, 5):
+        if await email_verification_succeeded(page):
+            return True
+        if delay:
+            await asyncio.sleep(delay)
+    return await email_verification_succeeded(page)
+
+
 _VERIFICATION_SUBMIT_LABELS = [
     "Continue", "続行", "Verify", "確認", "确认", "继续", "Submit", "次へ",
-    "Teruskan", "Sahkan",
+    "Teruskan", "Sahkan", "Lanjutkan",
 ]
 _VERIFICATION_RETRY_LABELS = [
     "Retry", "重试", "重試", "再试一次", "再試行", "Réessayer", "Erneut versuchen",
 ]
 
 
-async def _fill_and_submit_email_code(page, code_sel, code, *, tries=3, verbose=True):
+async def _fill_and_submit_email_code(
+    page,
+    code_sel,
+    code,
+    *,
+    tries=3,
+    verbose=True,
+    submit_method="click",
+):
     code_input = page.locator(code_sel).first
     if await code_input.count() == 0:
         return False
     if not await react_fill(page, code_sel, code, tries=tries, verbose=verbose):
         print("  [4] code fill not committed after retries")
-    if not await click_any_exact(page, _VERIFICATION_SUBMIT_LABELS):
-        submit = page.locator('button[type="submit"]')
-        if await submit.count() > 0:
-            await submit.first.click()
-        else:
+        return False
+    try:
+        if (await code_input.input_value()).strip() != str(code).strip():
+            print("  [4] code value changed before submit")
             return False
-    return True
+    except Exception:
+        return False
+
+    if submit_method == "request_submit":
+        try:
+            submitted = await code_input.evaluate(
+                """node => {
+                    const form = node.form || node.closest('form');
+                    if (!form) return false;
+                    const submitter = [...form.querySelectorAll(
+                        'button[type="submit"], input[type="submit"]'
+                    )].find(element => !element.disabled);
+                    if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit(submitter || undefined);
+                    } else {
+                        form.submit();
+                    }
+                    return true;
+                }"""
+            )
+            if submitted:
+                print("  [4] submitted verification through form.requestSubmit()")
+                return True
+        except Exception as error:
+            if verbose:
+                print(f"  [4] requestSubmit failed: {str(error)[:80]}")
+        return False
+
+    if submit_method == "enter":
+        try:
+            await code_input.press("Enter", timeout=5000)
+            print("  [4] submitted verification with Enter")
+            return True
+        except Exception as error:
+            if verbose:
+                print(f"  [4] keyboard submit failed: {str(error)[:80]}")
+            return False
+
+    if await click_any_exact(page, _VERIFICATION_SUBMIT_LABELS):
+        print("  [4] clicked verification Continue")
+        return True
+    submit = page.locator('button[type="submit"]:not([disabled])').first
+    if await submit.count() == 0:
+        return False
+    try:
+        await submit.click(timeout=8000)
+        print("  [4] clicked verification submit button")
+        return True
+    except Exception:
+        return False
 
 
-async def submit_email_verification_code(page, code_sel, code, route_retries=2):
+async def _raise_email_verification_error(auth_monitor, page=None):
+    error = await auth_monitor.latest() if auth_monitor else None
+    if error:
+        print(
+            f"  [4] verification service rejected: code={error['code']} "
+            f"status={error['status']} path={error['url']} "
+            f"message={error['message'][:120]}"
+        )
+        rejection = f"{error['code']} {error['message']}".lower()
+        if any(marker in rejection for marker in ("invalid", "expired", "incorrect", "code")):
+            raise EmailVerificationRetryNeeded(
+                f"email_verification_rejected:{error['code']}:{error['message'][:80]}"
+            )
+        raise RuntimeError(
+            f"email_verification_rejected:{error['code']}:{error['message'][:80]}"
+        )
+    hint = await _email_verification_ui_hint(page) if page is not None else ""
+    if hint:
+        print(f"  [4] verification UI rejected: {hint}")
+        raise EmailVerificationRetryNeeded(
+            f"email_verification_ui_rejected:{hint[:80]}"
+        )
+
+
+async def submit_email_verification_code(
+    page, code_sel, code, route_retries=2, auth_monitor=None
+):
     """Submit an email code and recover the transient auth HTML route error."""
+    if auth_monitor:
+        await auth_monitor.clear()
     if not await _fill_and_submit_email_code(page, code_sel, code):
         raise RuntimeError("email_verification_form_unavailable")
-    await asyncio.sleep(5)
+    await _wait_for_email_verification_result(page)
     await dump_state(page, "after-code")
+    if await email_verification_succeeded(page):
+        print("  [4] email verification accepted")
+        return
 
     for attempt in range(route_retries):
         if not await is_email_verification_route_error(page):
@@ -490,7 +1116,7 @@ async def submit_email_verification_code(page, code_sel, code, route_retries=2):
         )
         if not await click_any_exact(page, _VERIFICATION_RETRY_LABELS):
             break
-        await asyncio.sleep(5)
+        await _wait_for_email_verification_result(page)
         if not any(
             marker in page.url.lower()
             for marker in ("verification", "verify", "email-verification")
@@ -500,13 +1126,17 @@ async def submit_email_verification_code(page, code_sel, code, route_retries=2):
             await _fill_and_submit_email_code(
                 page, code_sel, code, tries=2, verbose=False
             )
-            await asyncio.sleep(5)
+            await _wait_for_email_verification_result(page)
         await dump_state(page, f"after-code-route-retry-{attempt + 1}")
+        if await email_verification_succeeded(page):
+            print("  [4] email verification accepted")
+            return
 
     if await is_email_verification_route_error(page):
         raise RuntimeError(
             "email_verification_route_error: auth route kept returning HTML after Retry"
         )
+    await _raise_email_verification_error(auth_monitor, page)
 
     if any(
         marker in page.url.lower()
@@ -514,19 +1144,46 @@ async def submit_email_verification_code(page, code_sel, code, route_retries=2):
     ):
         code_input = page.locator(code_sel).first
         if await code_input.count() == 0:
-            raise RuntimeError("email_verification_not_completed")
-        print("  [4] still on verification page, re-submitting code once...")
+            if await email_verification_succeeded(page):
+                print("  [4] email verification accepted")
+                return
+            raise EmailVerificationRetryNeeded(
+                "email_verification_form_disappeared_without_success"
+            )
+        try:
+            if not (await code_input.input_value()).strip():
+                raise EmailVerificationRetryNeeded(
+                    "email_verification_code_cleared_after_submit"
+                )
+        except EmailVerificationRetryNeeded:
+            raise
+        except Exception:
+            pass
+        print("  [4] verification click did not advance; using native form submit...")
+        if auth_monitor:
+            await auth_monitor.clear()
         if not await _fill_and_submit_email_code(
-            page, code_sel, code, tries=2, verbose=False
+            page,
+            code_sel,
+            code,
+            tries=2,
+            verbose=False,
+            submit_method="request_submit",
         ):
             raise RuntimeError("email_verification_submit_unavailable")
-        await asyncio.sleep(5)
+        await _wait_for_email_verification_result(page)
         await dump_state(page, "after-code-retry")
+        if await email_verification_succeeded(page):
+            print("  [4] email verification accepted")
+            return
+        await _raise_email_verification_error(auth_monitor, page)
         if any(
             marker in page.url.lower()
             for marker in ("verification", "verify", "email-verification")
         ):
-            raise RuntimeError("email_verification_not_completed")
+            raise EmailVerificationRetryNeeded(
+                "email_verification_stuck_after_submit"
+            )
 
 
 # OpenAI 发件人 / 验证码邮件特征
@@ -583,14 +1240,119 @@ async def dump_state(page, tag=""):
         print(f"  dump_state error: {e}")
 
 
+async def _chatgpt_entry_document_ready(page):
+    """Accept a timed-out navigation only when a usable auth document committed."""
+    try:
+        host = (urlsplit(str(page.url or "")).hostname or "").lower()
+        if host not in {"chatgpt.com", "auth.openai.com"}:
+            return False
+
+        async def inspect():
+            if await page.locator('input[type="email"], input[name="email"]').count() > 0:
+                return True
+            challenge = page.locator(
+                'input[name="cf-turnstile-response"], .cf-turnstile, '
+                'iframe[src*="challenges.cloudflare"]'
+            )
+            if await challenge.count() > 0:
+                return True
+            body = await page.locator("body").inner_text(timeout=1500)
+            return len(body.strip()) >= 5
+
+        return bool(await asyncio.wait_for(inspect(), timeout=2.5))
+    except Exception:
+        return False
+
+
+async def navigate_chatgpt_signup(
+    context,
+    page,
+    response_observer=None,
+    *,
+    max_attempts=None,
+    rotate_on_stall=True,
+):
+    """Open ChatGPT auth without reusing a tab whose navigation is wedged."""
+    timeout_seconds = max(15, min(45, _env_int("CHATGPT_GOTO_TIMEOUT_SECONDS", 30)))
+    configured_attempts = (
+        _env_int("CHATGPT_GOTO_ATTEMPTS", 3)
+        if max_attempts is None
+        else max_attempts
+    )
+    attempts = max(1, min(4, int(configured_attempts)))
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(
+                SIGNUP_URL,
+                timeout=timeout_seconds * 1000,
+                wait_until="domcontentloaded",
+            )
+            return page
+        except Exception as exc:
+            if await _chatgpt_entry_document_ready(page):
+                print("  [1] goto timed out after document commit; continuing")
+                return page
+            print(f"  goto retry {attempt}/{attempts}: {str(exc)[:70]}")
+            if attempt >= attempts:
+                break
+
+            requested = str(CHATGPT_NODE or "auto").strip().lower()
+            if (
+                rotate_on_stall
+                and proxy_switch.proxy_mode() == "clash_auto"
+                and requested == "auto"
+            ):
+                node = await _rotate_chatgpt_auto_node()
+                print(f"  [node] browser goto stalled; switched to {node or 'no usable node'}")
+            else:
+                await asyncio.sleep(2)
+
+            old_page = page
+            try:
+                fresh_page = await asyncio.wait_for(context.new_page(), timeout=12)
+                if response_observer:
+                    fresh_page.on("response", response_observer)
+                page = fresh_page
+            except Exception as reset_exc:
+                print(f"  [1] clean-tab recovery failed: {str(reset_exc)[:80]}")
+                continue
+            try:
+                await asyncio.wait_for(old_page.close(), timeout=4)
+            except Exception:
+                pass
+            print("  [1] opened a clean tab after stalled navigation")
+    return None
+
+
+async def _click_locator(locator, timeout=5000):
+    """Click a ready locator, with a DOM fallback for transient overlays."""
+    try:
+        await locator.click(timeout=timeout, no_wait_after=True)
+        return True
+    except Exception:
+        pass
+    try:
+        await locator.evaluate(
+            """el => {
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+                    throw new Error('button disabled');
+                }
+                el.click();
+            }"""
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def click_exact(page, label, timeout=5000):
     """精确点击文本完全等于 label 的按钮（避免 has-text 子串误匹配，
     如 'Continue' 误点 'Continue with Google'）。返回是否点击成功。"""
     try:
         btn = page.get_by_role("button", name=label, exact=True)
         if await btn.count() > 0:
-            await btn.first.click(timeout=timeout)
-            return True
+            if await _click_locator(btn.first, timeout=timeout):
+                return True
     except Exception:
         pass
     # 退化：用 CSS 但排除 "with" 字样
@@ -600,10 +1362,68 @@ async def click_exact(page, label, timeout=5000):
         for i in range(n):
             t = (await cand.nth(i).inner_text()).strip()
             if t == label:
-                await cand.nth(i).click(timeout=timeout)
+                if await _click_locator(cand.nth(i), timeout=timeout):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+async def _submit_chatgpt_email_form_once(page):
+    """Submit the current email form without reusing a detached locator."""
+    # The consent banner can mount after the email field is filled and
+    # intercept the first Continue click. Clear it immediately before every
+    # attempt, then ensure React still has a non-empty value.
+    await wait_for_cookie_banner_settle(page, timeout=2500)
+    try:
+        current_input = page.locator('input[type="email"], input[name="email"]').first
+        if await current_input.count() > 0 and await current_input.is_visible():
+            if not (await current_input.input_value()).strip():
+                print("  [2] email Continue skipped: React email value is empty")
+                return False
+    except Exception:
+        # A navigation may detach the email field between the check and click.
+        pass
+    labels = ["Continue", "缍氳", "缁х画", "绻肩簩", "Next", "涓嬩竴姝?", "Teruskan", "Weiter"]
+    if await click_any_exact(page, labels):
+        await asyncio.sleep(0.35)
+        await dismiss_cookie_banner(page)
+        return True
+    submit = page.locator('button[type="submit"]:not([disabled]):not([aria-disabled="true"])').first
+    try:
+        if await submit.count() > 0 and await submit.is_visible():
+            if await _click_locator(submit, timeout=8000):
+                await asyncio.sleep(0.35)
+                await dismiss_cookie_banner(page)
                 return True
     except Exception:
         pass
+    fresh_input = page.locator('input[type="email"], input[name="email"]').first
+    try:
+        if (
+            await fresh_input.count() > 0
+            and await fresh_input.is_visible()
+            and (await fresh_input.input_value()).strip()
+        ):
+            await fresh_input.press("Enter", timeout=8000)
+            await asyncio.sleep(0.35)
+            await dismiss_cookie_banner(page)
+            return True
+    except Exception:
+        pass
+    print(f"  [2] email Continue unavailable (url={page.url[:100]})")
+    return False
+
+
+async def submit_chatgpt_email_form(page, timeout=12000):
+    """Wait for the auth form to hydrate before submitting it."""
+    deadline = time.monotonic() + max(1, timeout) / 1000
+    while time.monotonic() < deadline:
+        await dismiss_cookie_banner(page)
+        if await _submit_chatgpt_email_form_once(page):
+            return True
+        await asyncio.sleep(0.4)
+    print(f"  [2] email Continue unavailable (url={page.url[:100]})")
     return False
 
 
@@ -629,7 +1449,7 @@ async def _click_resend_code(page):
     labels = ["Resend code", "Resend email", "Resend", "Send again", "Send a new code",
               "再送信", "再送", "コードを再送", "重新发送", "重新發送", "重发",
               "重新傳送電郵", "重新传送电邮", "重新傳送", "重新传送", "重新傳送驗證碼", "重新獲取",
-              "Kirim semula", "Hantar semula"]
+              "Kirim semula", "Hantar semula", "Kirim ulang", "Kirim ulang email"]
     for lbl in labels:
         for getter in (
             lambda l=lbl: page.get_by_role("button", name=l, exact=False),
@@ -654,14 +1474,43 @@ async def dismiss_cookie_banner(page):
     for label in _COOKIE_BTNS:
         try:
             b = page.get_by_role("button", name=label, exact=True)
-            if await b.count() > 0:
-                await b.first.click(timeout=2000)
+            if await b.count() > 0 and await b.first.is_visible():
+                if not await _click_locator(b.first, timeout=2000):
+                    continue
                 print(f"  [cookie] dismissed: {label}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.25)
                 return True
         except Exception:
             pass
     return False
+
+
+async def seed_chatgpt_cookie_consent(context):
+    """Preseed the same consent state as the existing Accept all action."""
+    try:
+        expires = int(time.time()) + 365 * 24 * 60 * 60
+        await context.add_cookies([
+            {
+                "name": "oai_consent_analytics",
+                "value": "true",
+                "domain": ".chatgpt.com",
+                "path": "/",
+                "expires": expires,
+                "sameSite": "Lax",
+            },
+            {
+                "name": "oai_consent_marketing",
+                "value": "true",
+                "domain": ".chatgpt.com",
+                "path": "/",
+                "expires": expires,
+                "sameSite": "Lax",
+            },
+        ])
+        return True
+    except Exception as error:
+        print(f"  [cookie] consent preseed failed: {str(error)[:100]}")
+        return False
 
 
 async def fill_email_verified(page, email_input, email, tries=4):
@@ -679,6 +1528,25 @@ async def fill_email_verified(page, email_input, email, tries=4):
         # 2) 等横幅真正消失/页面稳定再填——横幅抢焦点会让键盘输入落空，必须等它落定
         await asyncio.sleep(0.8)
         await dismiss_cookie_banner(page)
+        # Do not clear a value that is already correct. react_fill resets the
+        # field on each attempt, which can create an empty React submission.
+        try:
+            current = page.locator(sel).first
+            if (
+                await current.count() > 0
+                and await current.is_visible()
+                and (await current.input_value()).strip() == email
+            ):
+                await asyncio.sleep(0.15)
+                fresh = page.locator(sel).first
+                if (
+                    await fresh.count() > 0
+                    and await fresh.is_visible()
+                    and (await fresh.input_value()).strip() == email
+                ):
+                    return True
+        except Exception:
+            pass
         # 3) 填邮箱（React 受控输入）
         if await react_fill(page, sel, email, tries=2, verbose=False):
             # 4) 填完立即确认：横幅若此刻才冒出来盖住，关掉它并回读校验，防 setter 误报
@@ -688,7 +1556,7 @@ async def fill_email_verified(page, email_input, email, tries=4):
                 if (await page.locator(sel).first.input_value()).strip() == email:
                     return True
             except Exception:
-                return True
+                pass
         print(f"  [2] email not committed, retry {i+1}/{tries}")
         await asyncio.sleep(1)
     return False
@@ -722,7 +1590,11 @@ async def wait_for_chatgpt_auth_step(page, timeout=20):
                 # against a locator that is detached by a late CF transition.
                 if email_visible_since is None:
                     email_visible_since = time.monotonic()
-                elif time.monotonic() - email_visible_since >= min(3, timeout):
+                # Auth.openai.com can keep the old SPA form mounted while the
+                # hand-off is in flight. Three seconds causes duplicate
+                # submits on slower Clash routes.
+                stable_window = min(8, max(3, timeout * 0.4))
+                if time.monotonic() - email_visible_since >= stable_window:
                     return "email"
             else:
                 email_visible_since = None
@@ -752,6 +1624,243 @@ async def wait_for_chatgpt_auth_step(page, timeout=20):
             pass
         await asyncio.sleep(0.5)
     return "unknown"
+
+
+async def ensure_chatgpt_email_entry(page, retries=2):
+    """Recover an expired auth hand-off before looking for the email field."""
+    selector = 'input[type="email"], input[name="email"]'
+    for attempt in range(max(1, retries + 1)):
+        try:
+            field = page.locator(selector).first
+            if await field.count() > 0 and await field.is_visible():
+                return True
+            body = (await page.locator("body").inner_text(timeout=2500)).lower()
+        except Exception:
+            body = ""
+        expired = any(marker in body for marker in (
+            "your session has ended",
+            "session has expired",
+            "会话已结束",
+            "会話の有効期限",
+        ))
+        if not expired or attempt >= retries:
+            return False
+        print(f"  [1] auth hand-off expired; reopening ChatGPT login ({attempt + 1}/{retries})")
+        await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
+        await asyncio.sleep(4)
+    return False
+
+
+async def wait_for_cookie_banner_settle(page, timeout=5000):
+    """Wait for a late consent banner, accept it, and finish its rerender."""
+    # The marker lives in the document, so a real navigation automatically
+    # resets it while repeated submit helpers on the same page stay fast.
+    try:
+        already_settled = bool(await page.evaluate(
+            "() => window.__regFactoryCookieConsentSettled === true"
+        ))
+    except Exception:
+        already_settled = False
+    if already_settled:
+        if await dismiss_cookie_banner(page):
+            await asyncio.sleep(0.8)
+        return True
+
+    async def mark_settled():
+        try:
+            await page.evaluate(
+                "() => { window.__regFactoryCookieConsentSettled = true; }"
+            )
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + max(0, timeout) / 1000
+    clicked = False
+    while time.monotonic() < deadline:
+        if await dismiss_cookie_banner(page):
+            clicked = True
+            # Accepting consent updates storage and remounts part of the SPA.
+            await asyncio.sleep(0.8)
+            continue
+        if clicked:
+            # Catch a second banner mount before declaring the page stable.
+            await asyncio.sleep(0.25)
+            if not await dismiss_cookie_banner(page):
+                await mark_settled()
+                return True
+        else:
+            await asyncio.sleep(0.15)
+    await mark_settled()
+    return clicked
+
+
+async def recover_stuck_chatgpt_email_submit(page, email):
+    """Reopen a clean auth document when the SPA leaves ``?email=`` in place."""
+    for attempt in range(1, 3):
+        try:
+            print(f"  [2] reopening clean ChatGPT login after stuck email ({attempt}/2)")
+            await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            await dismiss_cookie_banner(page)
+            email_input = page.locator(
+                'input[type="email"], input[name="email"]'
+            ).first
+            if await email_input.count() == 0:
+                continue
+            if not await fill_email_verified(page, email_input, email, tries=3):
+                continue
+            if not await submit_chatgpt_email_form(page):
+                continue
+            await asyncio.sleep(4)
+            step = await wait_for_chatgpt_auth_step(page, timeout=15)
+            if step not in {"email", "unknown"}:
+                print(f"  [2] clean email submit advanced to {step}")
+                return step
+        except Exception as error:
+            print(f"  [2] clean email submit retry failed: {str(error)[:90]}")
+    return "email"
+
+
+def create_chatgpt_icloud_mailbox():
+    """Allocate a low-cost iCloud submail for registration and code polling."""
+    return create_mailbox(provider="icloud", mail_type="icloud")
+
+
+def create_chatgpt_remail_mailbox():
+    """Allocate the configured Remail project/suffix for registration and polling."""
+    return create_mailbox(provider="remail")
+
+
+def _icloud_registration_root(email):
+    """Return the canonical iCloud mother address used by plus submail."""
+    local, separator, domain = str(email or "").strip().lower().partition("@")
+    if not separator:
+        return ""
+    return f"{local.split('+', 1)[0]}@{domain}"
+
+
+def _known_icloud_registration_roots():
+    """Load mother addresses OpenAI has already rejected as existing users."""
+    data_root = _os.environ.get("REG_FACTORY_DATA_DIR", "").strip() or "."
+    path = _os.path.join(data_root, "emails_error_chatgpt.txt")
+    roots = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "user_already_exists" not in line.lower():
+                    continue
+                email = line.split("----", 1)[0].strip()
+                root = _icloud_registration_root(email)
+                if root:
+                    roots.add(root)
+    except OSError:
+        pass
+    return roots
+
+
+def _allocate_untainted_chatgpt_icloud_mailbox(max_attempts=12):
+    tainted_roots = _known_icloud_registration_roots()
+    for _ in range(max(1, int(max_attempts))):
+        mailbox = create_chatgpt_icloud_mailbox()
+        root = _icloud_registration_root(mailbox.get("email"))
+        if root and root in tainted_roots:
+            print(f"  [email] skipping known ChatGPT iCloud mother mailbox: {root}")
+            continue
+        return mailbox
+    raise RuntimeError("iCloud submail pool repeatedly returned known ChatGPT mother mailboxes")
+
+
+def allocate_chatgpt_registration_mailbox():
+    """Allocate the configured mailbox, falling back without reusing claimed mail."""
+    if FIXED_EMAIL:
+        return {
+            "email": FIXED_EMAIL,
+            "password": FIXED_PASSWORD or "",
+            "refresh_token": FIXED_REFRESH_TOKEN or "",
+            "client_id": FIXED_CLIENT_ID or "",
+            "mailbox": None,
+        }
+
+    if EMAIL_PROVIDER in {"icloud", "remail"}:
+        try:
+            if EMAIL_PROVIDER == "icloud":
+                mailbox = _allocate_untainted_chatgpt_icloud_mailbox()
+                label = "iCloud submail"
+            else:
+                mailbox = create_chatgpt_remail_mailbox()
+                label = f"Remail ({mailbox.get('email', '').split('@')[-1]})"
+            print(f"  [email] {label} allocated: {mailbox['email']}")
+            return {
+                "email": mailbox["email"],
+                "password": "",
+                "refresh_token": "",
+                "client_id": "",
+                "mailbox": mailbox,
+            }
+        except Exception as exc:
+            print(f"  [email] {EMAIL_PROVIDER} mailbox unavailable: {str(exc)[:160]}")
+            return None
+
+    # Prefer a mailbox whose Graph token and inbox were verified just now.
+    # Password login remains a fallback for pools without usable RT assets.
+    selected = email_pool.retryable_email(
+        PLATFORM, require_token=True, validate_token=True
+    )
+    if not selected:
+        selected = email_pool.latest_email(
+        PLATFORM, require_token=True, validate_token=True
+        )
+    if not selected:
+        print("  [email] no verified Graph mailbox; using password fallback")
+        selected = email_pool.next_email(PLATFORM)
+    if selected:
+        email, password, refresh_token, client_id = selected
+        return {
+            "email": email,
+            "password": password,
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "mailbox": None,
+        }
+
+    fallback = _os.environ.get("CHATGPT_POOL_ICLOUD_FALLBACK", "true").strip().lower()
+    if fallback in {"0", "false", "no", "off"}:
+        return None
+    print("  [email] Outlook pool exhausted; switching to iCloud mailbox")
+    try:
+        mailbox = _allocate_untainted_chatgpt_icloud_mailbox()
+        print(f"  [email] iCloud submail allocated: {mailbox['email']}")
+        return {
+            "email": mailbox["email"],
+            "password": "",
+            "refresh_token": "",
+            "client_id": "",
+            "mailbox": mailbox,
+        }
+    except Exception as exc:
+        print(f"  [email] iCloud fallback unavailable: {str(exc)[:160]}")
+        return None
+
+
+async def check_chatgpt_plus_trial_after_registration(session, email):
+    """Run the single-account Plus label check without making it fatal."""
+    if not session:
+        return None
+    try:
+        from common.asset_scanner import check_chatgpt_plus_trial_for_session
+
+        result = await asyncio.to_thread(
+            check_chatgpt_plus_trial_for_session, session, email, 15
+        )
+        print(
+            f"  [plus-check] {email}: "
+            f"{result.get('plus_trial', 'unknown')} - "
+            f"{result.get('plus_trial_detail', '')}"
+        )
+        return result
+    except Exception as exc:
+        print(f"  [plus-check][WARN] {email}: {str(exc)[:120]}")
+        return None
 
 
 def should_use_browser_mail_fallback(has_graph_token, code_try, total_tries=3):
@@ -793,14 +1902,23 @@ def import_chatgpt2api(session, email):
         print(f"  [c2a] 导入失败: {str(e)[:120]}")
 
 
-async def extract_codex(page, email, p=None, ctx=None, release_current=None):
-    """注册成功后顺手走 Codex OAuth 提取 refresh_token 导入 SUB2API（--codex）。
+async def extract_codex(
+    page, email, p=None, ctx=None, release_current=None, totp_secret=""
+):
+    """注册成功后顺手走 Codex OAuth（--codex）。
     复用刚注册完已登录的 page（无需像 oauth_codex.py 那样重载 cookie 再登），
-    直接在该窗口打开 SUB2API 生成的授权链接 -> 同意 -> 捕获 localhost:1455 回调 -> 换码建号。
-    带真 refresh_token 的 OAuth 凭据，SUB2API 当 oauth 账号可续期（网页 session 无 rt 会 401）。
+    默认打开 SUB2API 生成的授权链接并换码建号；CPA 模式则由 CPA 生成授权链接并接收 callback。
+    SUB2API 模式会保存带真 refresh_token 的 OAuth 凭据，网页 session 本身没有可续期的 rt。
     失败只打印告警，不影响注册成功判定。返回是否成功。"""
-    if not (SUB2API_URL and SUB2API_EMAIL and SUB2API_PASSWORD):
+    auth_source = str(_os.environ.get("CODEX_AUTH_URL_SOURCE", CODEX_AUTH_URL_SOURCE) or "sub2").strip().lower()
+    if auth_source not in {"sub2", "cpa"}:
+        print(f"  [codex] 未知 CODEX_AUTH_URL_SOURCE={auth_source}，跳过")
+        return False
+    if auth_source == "sub2" and not (SUB2API_URL and SUB2API_EMAIL and SUB2API_PASSWORD):
         print("  [codex] 未配置 SUB2API_URL/EMAIL/PASSWORD（.env），跳过")
+        return False
+    if auth_source == "cpa" and not (CPA_URL and CPA_MGMT_KEY):
+        print("  [codex] CPA 模式未配置 CPA_URL/CPA_MGMT_KEY（.env），跳过")
         return False
     try:
         from common.uploaders import _origin
@@ -810,7 +1928,7 @@ async def extract_codex(page, email, p=None, ctx=None, release_current=None):
         return False
 
     group = CODEX_GROUP or SUB2API_GROUP
-    origin = _origin(SUB2API_URL)
+    origin = _origin(SUB2API_URL) if auth_source == "sub2" else ""
     # 注册完页面可能停在 "You're all set / Continue" 欢迎拦层（或各种 onboarding 弹层），
     # 不清掉就直接开授权，auth_url 会被拦/重定向，drive_authorize 在循环里卡死。
     # 先尽力点掉 Continue、并导航到干净首页，给 OAuth 一个干净起点。
@@ -838,11 +1956,19 @@ async def extract_codex(page, email, p=None, ctx=None, release_current=None):
     # 实测部分新号 OAuth 必弹手机(手机要求偏向绑账号)，赌免手机多半白跑，故默认直接接码；想赌设 N>0。
     skip_n = _env_int("CODEX_PHONE_SKIP_ATTEMPTS", 0)
     try:
-        # SUB2API: 登录 + 找 openai 分组（PKCE/换码由 SUB2API 包办）
-        token = ox.sub2api_login(origin, SUB2API_EMAIL, SUB2API_PASSWORD)
-        group_id = ox.find_group_id(origin, token, group)
+        token = None
+        group_id = None
+        if auth_source == "sub2":
+            # SUB2API: 登录 + 找 openai 分组（PKCE/换码由 SUB2API 包办）
+            token = ox.sub2api_login(origin, SUB2API_EMAIL, SUB2API_PASSWORD)
+            group_id = ox.find_group_id(origin, token, group)
+        else:
+            print("  [codex] CPA: 使用管理接口生成授权地址并接收 callback")
         _skipmsg = f"免手机直连先试 {skip_n} 次，弹手机才接码" if skip_n > 0 else "直接一次性接码(不赌免手机)"
-        print(f"  [codex] SUB2API: group={group}(#{group_id})，{_skipmsg}")
+        if auth_source == "sub2":
+            print(f"  [codex] SUB2API: group={group}(#{group_id})，{_skipmsg}")
+        else:
+            print(f"  [codex] CPA 授权，{_skipmsg}")
 
         # 每次尝试关窗口重开+重登(cookie)，确保是 OpenAI 眼里全新会话(同窗口重发 auth_url
         # 不改变其"要不要手机"的风控决定)，且避开刚注册窗口的促销弹层(Claim offer 等会挡住
@@ -852,24 +1978,35 @@ async def extract_codex(page, email, p=None, ctx=None, release_current=None):
         if p is not None and ctx is not None:
             try:
                 cookies = await ctx.cookies()
-                use_clash = (CHATGPT_NODE or "auto").lower() not in {"none", "off", "direct"}
                 reset_fn = ox.make_reset_page(
                     p,
                     cookies,
                     account_email=email,
                     before_open=release_current,
-                    browser_options=clash_browser_proxy_fields() if use_clash else None,
+                    browser_options=chatgpt_browser_proxy_fields(),
                 )
             except Exception as e:
                 print(f"  [codex] 构造窗口重置器失败(退化为复用窗口): {str(e)[:60]}")
                 reset_fn = None
 
         # 驱动授权（先免手机 N 次，最后一次放开手机），捕获 localhost:1455 回调
+        codex_metadata = {}
+        auth_url = ""
+        def _generate_auth():
+            nonlocal auth_url
+            if auth_source == "cpa":
+                auth_url, state = ox.generate_cpa_auth_url(CPA_URL, CPA_MGMT_KEY)
+                return auth_url, "", state
+            auth_url, session_id, state = ox.generate_auth_url(origin, token)
+            return auth_url, session_id, state
+
         code, session_id, cb_state, msg = await ox.authorize_with_retry(
-            page, lambda: ox.generate_auth_url(origin, token),
+            page, _generate_auth,
             account_email=email, phone_skip_attempts=skip_n,
             skip_timeout=120, phone_timeout=timeout, manual_phone=CODEX_MANUAL_PHONE,
-            reset_page=reset_fn, sms_provider=CODEX_SMS_PROVIDER)
+            semi_phone=CODEX_PHONE,
+            reset_page=reset_fn, sms_provider=CODEX_SMS_PROVIDER,
+            result_metadata=codex_metadata, totp_secret=totp_secret)
         if reset_fn is not None:
             try:
                 await reset_fn.cleanup()
@@ -879,9 +2016,30 @@ async def extract_codex(page, email, p=None, ctx=None, release_current=None):
             print(f"  [codex] 授权未完成: {msg}")
             return False
 
+        if auth_source == "cpa":
+            callback = ox.callback_url(code, cb_state, auth_url)
+            cpa_result = ox.submit_cpa_callback(
+                CPA_URL,
+                CPA_MGMT_KEY,
+                callback,
+                retries=_env_int("CODEX_CPA_CALLBACK_RETRIES", 5),
+                retry_delay=float(_os.environ.get("CODEX_CPA_CALLBACK_RETRY_DELAY", "3") or "3"),
+            )
+            print(f"  [codex][CPA] callback 已提交（{str(cpa_result.get('message') or 'accepted')[:120]}）✅")
+            return True
+
         # 换码 + 建 oauth 账号（带 refresh_token）
         exch = ox.exchange_code(origin, token, session_id, code, cb_state)
         cred = ox.build_oauth_credentials(exch)
+        cred["codex_phone_status"] = codex_metadata.get("codex_phone_status", "unknown")
+        from common.session_export import save_codex_oauth_credentials
+        persisted_cred = dict(cred)
+        if totp_secret:
+            persisted_cred["two_factor"] = totp_secret
+            persisted_cred["totp_secret"] = totp_secret
+        save_codex_oauth_credentials(
+            persisted_cred, email=cred.get("email") or email
+        )
         print(f"  [codex] exchange-code OK: refresh_token={'YES' if cred.get('refresh_token') else 'NO'} "
               f"plan={cred.get('plan_type')}")
         acct = ox.create_oauth_account(origin, token, cred, [group_id],
@@ -912,110 +2070,142 @@ async def register_one(index, total, p):
         if time.time() - start > REGISTER_TIMEOUT:
             raise TimeoutError(f"timeout {REGISTER_TIMEOUT}s")
 
-    mailbox = None
-    # 取邮箱。调试同一邮箱注册多平台时可通过 CLI 指定，避免邮箱池自动分配。
-    if FIXED_EMAIL:
-        email = FIXED_EMAIL
-        email_pw = FIXED_PASSWORD or ""
-        refresh_token = FIXED_REFRESH_TOKEN or ""
-        client_id = FIXED_CLIENT_ID or ""
-    elif EMAIL_PROVIDER == "icloud":
-        try:
-            mailbox = create_mailbox(provider="icloud")
-            email = mailbox["email"]
-            email_pw = refresh_token = client_id = ""
-            print(f"  [email] iCloud mailbox allocated: {email}")
-        except Exception as exc:
-            print(f"  [email] iCloud mailbox unavailable: {str(exc)[:160]}")
-            return None
-    else:
-        em = email_pool.next_email(PLATFORM)
-        if not em:
-            print("  no email available")
-            return None
-        email, email_pw, refresh_token, client_id = em
+    allocation = allocate_chatgpt_registration_mailbox()
+    if not allocation:
+        print("  no email available")
+        return None
+    email = allocation["email"]
+    email_pw = allocation["password"]
+    refresh_token = allocation["refresh_token"]
+    client_id = allocation["client_id"]
+    mailbox = allocation["mailbox"]
     password = rand_password()
     print(f"\n#{index}/{total} email={email}")
+    # Mailbox health scanning can quarantine a large stale pool. It is setup
+    # work and must not consume the browser registration deadline.
+    start = time.time()
 
     name = f"chatgpt_{time.strftime('%m%d_%H%M%S')}_{index}"
     bb = pid = None
     success = False
     try:
-        use_clash = (CHATGPT_NODE or "auto").lower() not in {"none", "off", "direct"}
-        bb, pid, browser, ctx, page = await open_and_connect(
-            name=name,
-            p=p,
-            browser_options=clash_browser_proxy_fields() if use_clash else None,
+        # A Clash node change cannot repair a BitBrowser profile whose tunnel
+        # was established on the previous node. Validate the hydrated auth SPA
+        # and rebuild the entire profile before rotating to another route.
+        profile_attempts = max(
+            1, min(4, _env_int("CHATGPT_GOTO_ATTEMPTS", 3))
         )
-        await ctx.clear_cookies()
-        auth_monitor = AuthResponseMonitor()
-        page.on("response", auth_monitor.observe)
+        profile_ready = False
+        profile_error = "goto_failed"
+        auth_monitor = None
+        consent_preseeded = False
 
-        # Step 1: 打开注册页（带重试，应对 ERR_CONNECTION_CLOSED 等偶发）
-        print("  [1] goto signup")
-        goto_ok = False
-        for attempt in range(4):
+        for profile_attempt in range(1, profile_attempts + 1):
+            profile_name = (
+                name
+                if profile_attempt == 1
+                else f"{name}_retry{profile_attempt}"
+            )
             try:
-                await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
-                goto_ok = True
-                break
-            except Exception as e:
-                print(f"  goto retry {attempt+1}/4: {str(e)[:70]}")
-                await asyncio.sleep(4)
-        if not goto_ok:
-            print("  goto failed after retries")
-            email_pool.mark_error(PLATFORM, email, email_pw, "goto_failed")
-            return None
-        await asyncio.sleep(5)
-        await dump_state(page, "after-load")
+                bb, pid, browser, ctx, page = await open_and_connect(
+                    name=profile_name,
+                    p=p,
+                    browser_options=chatgpt_browser_proxy_fields(),
+                )
+                await ctx.clear_cookies()
+                consent_preseeded = await seed_chatgpt_cookie_consent(ctx)
+                auth_monitor = AuthResponseMonitor()
+                asset_monitor = ChatGPTAuthAssetMonitor()
+                page.on("response", auth_monitor.observe)
+                page.on("requestfailed", auth_monitor.observe_failure)
+                asset_monitor.attach(page)
 
-        # Step 1.2: CF 全页拦截处理。先尝试点 Turnstile 勾选框(临界 IP 上有可点框，点了能过)，
-        # 点几次仍不放行(AWS 等死锁转圈)再换 CF 友好节点重载。两手都试，覆盖不同 IP 信誉档。
-        async def _try_pass_turnstile(rounds=4, wait=4):
-            for _ in range(rounds):
-                if not await _is_cf_blocked(page):
-                    return True
-                await _click_turnstile(page)
-                await asyncio.sleep(wait)
-            return not await _is_cf_blocked(page)
-
-        if await _is_cf_blocked(page):
-            print("  [cf] 检测到 Cloudflare 拦截，先尝试点 Turnstile 勾选框...")
-            if await _try_pass_turnstile():
-                print("  [cf] Turnstile 点击后放行 ✅")
-            else:
-                # 点不动/死锁 -> 轮换 CF 友好节点重载，每个节点再试点一次
-                passed = False
-                cf_candidates = _chatgpt_node_candidates()
-                for cf_try in range(len(cf_candidates)):
-                    node = _switch_cf_node()
-                    print(f"  [cf] 点击未过，切节点 -> {node or '失败'} 重载({cf_try+1}/{len(cf_candidates)})...")
-                    if not node:
-                        break
+                print(
+                    f"  [1] goto signup (profile {profile_attempt}/{profile_attempts})"
+                )
+                page = await navigate_chatgpt_signup(
+                    ctx,
+                    page,
+                    auth_monitor.observe,
+                    max_attempts=1,
+                    rotate_on_stall=False,
+                )
+                if page is None:
+                    profile_error = "goto_failed"
+                else:
                     await asyncio.sleep(3)
-                    try:
-                        await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(5)
-                    if await _try_pass_turnstile(rounds=2):
-                        print(f"  [cf] 节点 {node} 放行 ✅")
-                        passed = True
-                        break
-                if not passed:
-                    print("  [cf] 点击+换遍节点仍被拦，放弃本号")
-                    await dump_state(page, "cf-blocked")
-                    email_pool.mark_error(PLATFORM, email, email_pw, "cf_blocked")
-                    return None
+                    if await _is_cf_blocked(page):
+                        print("  [cf] 检测到 Cloudflare 拦截，尝试 Turnstile...")
+                        if await _try_pass_chatgpt_turnstile(page):
+                            print("  [cf] Turnstile 点击后放行")
+                        else:
+                            profile_error = "cf_blocked"
+                            _taint_active_chatgpt_node("cloudflare_turnstile")
+
+                    if not await _is_cf_blocked(page):
+                        email_entry_ready = await ensure_chatgpt_email_entry(page)
+                        assets_ready = (
+                            email_entry_ready
+                            and await wait_for_chatgpt_auth_assets(
+                                page, asset_monitor
+                            )
+                        )
+                        if not assets_ready:
+                            profile_error = "auth_assets_failed"
+                            print(
+                                "  [1] auth JS unavailable: "
+                                f"loaded={len(asset_monitor.loaded)} "
+                                f"failed={len(asset_monitor.failed)}; "
+                                "rebuilding browser profile"
+                            )
+                        elif email_entry_ready:
+                            profile_ready = True
+                            break
+                        else:
+                            profile_error = "no_email_input"
+            except Exception as entry_error:
+                profile_error = f"entry_{type(entry_error).__name__}"
+                print(f"  [1] profile failed: {str(entry_error)[:100]}")
+
+            if bb and pid:
+                await teardown(bb, pid, delete=True)
+            bb = pid = None
+
+            if profile_attempt >= profile_attempts:
+                break
+
+            requested = str(CHATGPT_NODE or "auto").strip().lower()
+            if (
+                proxy_switch.proxy_mode() == "clash_auto"
+                and requested == "auto"
+            ):
+                node = await _rotate_chatgpt_auto_node()
+                if not node:
+                    print("  [node] no additional usable ChatGPT node")
+                    break
+                print(f"  [node] rebuilding ChatGPT profile on {node}")
+            else:
+                print("  [1] rebuilding ChatGPT profile on the current route")
+                await asyncio.sleep(2)
+
+        if not profile_ready:
+            print(f"  [1][FAIL] ChatGPT entry unavailable: {profile_error}")
+            email_pool.mark_error(PLATFORM, email, email_pw, profile_error)
+            return None
+
+        await dump_state(page, "after-load")
 
         assert_chatgpt_node("before_email")
 
-        # Step 1.5: 先关 cookie 同意横幅（弹出时会挡住/抢焦点，导致邮箱填不进去 -> "邮箱必填"）
+        # Step 1.5: 先快速处理已经出现的横幅。延迟挂载的横幅在邮箱填好后
+        # 统一等待一次，避免启动阶段和每次提交都重复空等。
         await dismiss_cookie_banner(page)
-        # 关横幅后等页面稳定：横幅消失会触发重排/下拉渲染，等它落定再填，避免填到一半被重排打断
-        await asyncio.sleep(1.2)
-        await dismiss_cookie_banner(page)   # 横幅有时分两次弹，再补关一次
-        await asyncio.sleep(0.6)
+        # Preseeded consent normally settles in under a second; on routes that
+        # reject the cookie write, keep the longer late-mount fallback here so
+        # the email field is never written during a consent remount.
+        await wait_for_cookie_banner_settle(
+            page, timeout=750 if consent_preseeded else 6000
+        )
 
         # Step 2: 填邮箱 -> Continue
         print("  [2] fill email")
@@ -1027,15 +2217,29 @@ async def register_one(index, total, p):
             return None
         # 填邮箱（内部：每轮先关横幅再填，填完回读确认；见 fill_email_verified）
         if not await fill_email_verified(page, email_input, email):
-            print("  [2] email fill failed after retries")
-        # 提交前最后一道：关横幅（可能此刻才弹），并回读确认邮箱真在框里，否则再补填一次
-        await dismiss_cookie_banner(page)
+            print("  [2][FAIL] email was not committed; refusing blank submit")
+            await page.screenshot(path=f"screenshots/chatgpt_email_not_committed_{index}.png")
+            email_pool.mark_error(PLATFORM, email, email_pw, "email_not_committed")
+            return None
+        # 提交前等待一次延迟挂载的 consent manager。确认后页面可能重渲染，
+        # 所以必须重新读取 React 输入值，必要时补填后才能 Continue。
+        await wait_for_cookie_banner_settle(
+            page, timeout=750 if consent_preseeded else 6000
+        )
+        current_email = page.locator(
+            'input[type="email"], input[name="email"]'
+        ).first
         try:
-            if (await email_input.input_value()).strip() != email:
-                print("  [2] email empty before submit, refilling once...")
-                await fill_email_verified(page, email_input, email, tries=2)
+            current_value = (await current_email.input_value()).strip()
         except Exception:
-            pass
+            current_value = ""
+        if current_value != email:
+            print("  [2] email empty before submit, refilling once...")
+            if not await fill_email_verified(page, current_email, email, tries=2):
+                print("  [2][FAIL] email remained empty; refusing blank submit")
+                await page.screenshot(path=f"screenshots/chatgpt_email_not_committed_{index}.png")
+                email_pool.mark_error(PLATFORM, email, email_pw, "email_not_committed")
+                return None
         # 关键优化：在提交邮箱（触发 OpenAI 发码）【之前】先把 Outlook 登录好、过隐私协议、
         # 停在收件箱。这样提交后码一到立刻能扫到，避免"发码后才登录、登录+过协议耗时错过码"。
         # 注意：必须用【独立 BitBrowser 窗口】预登录，绝不能在注册 ctx 里 new_page —— 同 context
@@ -1064,12 +2268,9 @@ async def register_one(index, total, p):
             except Exception as e:
                 print(f"  [2.5] prelogin error: {str(e)[:60]}")
         # 提交：按钮文本中/英/日多语言精确匹配，避免点到 Continue with Google/Apple
-        if not await click_any_exact(page, ["Continue", "続行", "继续", "繼續", "Next", "下一步", "Teruskan"]):
-            sub = page.locator('button[type="submit"]')
-            if await sub.count() > 0:
-                await sub.first.click()
-            else:
-                await email_input.press("Enter")
+        verification_requested_at = time.time()
+        if not await submit_chatgpt_email_form(page):
+            print("  [2][FAIL] email Continue did not become actionable")
         await asyncio.sleep(5)
         check_timeout()
         auth_step = await wait_for_chatgpt_auth_step(page)
@@ -1083,11 +2284,13 @@ async def register_one(index, total, p):
         if any(k in body_l for k in ["必須", "必填", "required", "is required"]):
             print("  [2] still on login (email required), refilling once...")
             await dismiss_cookie_banner(page)
-            await fill_email_verified(page, email_input, email)
-            if not await click_any_exact(page, ["Continue", "続行", "继续", "繼續", "Teruskan"]):
-                sub = page.locator('button[type="submit"]')
-                if await sub.count() > 0:
-                    await sub.first.click()
+            if not await fill_email_verified(page, email_input, email):
+                print("  [2][FAIL] required retry could not commit email")
+                email_pool.mark_error(PLATFORM, email, email_pw, "email_not_committed")
+                return None
+            verification_requested_at = time.time()
+            if not await submit_chatgpt_email_form(page):
+                print("  [2][FAIL] email Continue retry did not become actionable")
             await asyncio.sleep(5)
             await dump_state(page, "after-email-retry")
 
@@ -1103,16 +2306,12 @@ async def register_one(index, total, p):
                 email_input = page.locator(
                     'input[type="email"], input[name="email"]'
                 ).first
-                await fill_email_verified(page, email_input, email, tries=2)
-                if not await click_any_exact(
-                    page,
-                    ["Continue", "続行", "继续", "繼續", "Next", "下一步", "Teruskan", "Weiter"],
-                ):
-                    sub = page.locator('button[type="submit"]')
-                    if await sub.count() > 0:
-                        await sub.first.click()
-                    else:
-                        await email_input.press("Enter")
+                if not await fill_email_verified(page, email_input, email, tries=2):
+                    print("  [2] retry email was not committed; skipping submit")
+                    continue
+                verification_requested_at = time.time()
+                if not await submit_chatgpt_email_form(page):
+                    print("  [2] email Continue retry did not become actionable")
                 await asyncio.sleep(5)
                 await dump_state(page, f"after-email-stuck-retry-{submit_retry + 1}")
             except Exception as exc:
@@ -1125,9 +2324,14 @@ async def register_one(index, total, p):
                     break
         auth_step = await wait_for_chatgpt_auth_step(page, timeout=5)
         if auth_step in {"email", "unknown"}:
-            print("  [2][FAIL] email form remained on login after retries")
-            email_pool.mark_error(PLATFORM, email, email_pw, "email_submit_stuck")
-            return None
+            verification_requested_at = time.time()
+            auth_step = await recover_stuck_chatgpt_email_submit(page, email)
+            if auth_step in {"email", "unknown"}:
+                if auth_monitor and auth_monitor.debug:
+                    print(f"  [auth-debug] {await auth_monitor.debug_summary()}")
+                print("  [2][FAIL] email form remained on login after clean-page recovery")
+                email_pool.mark_error(PLATFORM, email, email_pw, "email_submit_stuck")
+                return None
 
         # Step 3: 可能出现密码页 / 验证码页 / challenge
         # 先检测 challenge
@@ -1146,14 +2350,26 @@ async def register_one(index, total, p):
                     break
             if not challenge_cleared and await detect_challenge(page):
                 print("  [!][FAIL] challenge remained after 30s")
+                _taint_active_chatgpt_node("post_email_challenge")
                 email_pool.mark_error(PLATFORM, email, email_pw, "challenge_after_email")
                 return None
 
-        # 密码输入（注册流程会让设密码）
-        pw_input = page.locator('input[type="password"], input[name="password"], input[name="new-password"]')
-        if await pw_input.count() > 0:
-            print("  [3] fill password")
-            await human_type(page, 'input[type="password"]', password)
+        # 密码输入。登录密码页说明邮箱已经是已有账号，不能把随机注册密码
+        # 填进去；只有明确的 signup password 页面才继续。
+        password_step = await detect_chatgpt_password_step(page)
+        if password_step == "login":
+            reason = "existing_account_login_password_required"
+            print("  [3][FAIL] mailbox is already registered; login password page reached")
+            email_pool.mark_error(PLATFORM, email, email_pw, reason)
+            return None
+        if password_step == "create":
+            print("  [3] fill signup password")
+            await human_type(
+                page,
+                'input[type="password"]:visible, input[name="password"]:visible, '
+                'input[name="new-password"]:visible',
+                password,
+            )
             await asyncio.sleep(1)
             if not await click_exact(page, "Continue"):
                 sub = page.locator('button[type="submit"]')
@@ -1166,11 +2382,12 @@ async def register_one(index, total, p):
         # Step 4: 邮件验证码
         # ChatGPT 通常发 6 位验证码或确认链接
         verification_code_failed = False
+        fetch_email_code_for_reauth = None
         code_input = page.locator('input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]')
         if await code_input.count() > 0 or "verify" in page.url.lower() or "check" in (await page.locator("body").inner_text()).lower():
             code_sel = 'input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]'
 
-            icloud_seen_codes = set()
+            verification_seen_codes = set()
 
             async def _fetch_email_code(received_after=None, allow_browser_fallback=False):
                 """取一次码：先 Graph token，失败再浏览器登录 Outlook 取信。
@@ -1180,22 +2397,34 @@ async def register_one(index, total, p):
                 浏览器兜底只是去查同一个收件箱、纯浪费；取不到码该靠上层 resend 重发，而非开窗口。
                 received_after: resend 后传重发时刻，只收该时刻后到的邮件(旧码已被 OpenAI 作废)。"""
                 nonlocal mail_bb, mail_pid, mail_page, mail_logged_in
-                if mailbox and mailbox.get("provider") == "icloud":
+                code_timeout = max(
+                    30, min(180, _env_int("CHATGPT_VERIFICATION_CODE_TIMEOUT", 90))
+                )
+                poll_interval = max(
+                    2, min(15, _env_int("CHATGPT_VERIFICATION_POLL_INTERVAL", 5))
+                )
+                if mailbox and mailbox.get("provider") in {"icloud", "remail"}:
+                    mailbox_provider = mailbox.get("provider")
                     c = await poll_verification_code(
-                        mailbox["id"], "icloud", email=mailbox["email"],
-                        max_wait=120, poll_interval=4,
+                        mailbox["id"], mailbox_provider, email=mailbox["email"],
+                        token=mailbox.get("token"), api_key=mailbox.get("api_key"),
+                        base_url=mailbox.get("mail_api_url") or mailbox.get("base_url") or None,
+                        max_wait=code_timeout, poll_interval=poll_interval,
                         sender_hint=(), subject_hint=(), code_regex=r"\b(\d{6})\b",
-                        exclude_codes=tuple(icloud_seen_codes),
+                        exclude_codes=tuple(verification_seen_codes),
                     )
                     if c:
-                        icloud_seen_codes.add(str(c))
+                        verification_seen_codes.add(str(c))
                     return c
                 c = await asyncio.get_event_loop().run_in_executor(
                     None, functools.partial(
                         get_code_by_token, email, refresh_token, client_id or None,
-                        OAI_SENDER, OAI_SUBJECT, r"\b(\d{6})\b", 40, 5,
-                        received_after=received_after)
+                        OAI_SENDER, OAI_SUBJECT, r"\b(\d{6})\b", code_timeout, poll_interval,
+                        received_after=received_after,
+                        exclude_codes=tuple(verification_seen_codes))
                 )
+                if c:
+                    verification_seen_codes.add(str(c))
                 if c or (has_token and not allow_browser_fallback):
                     return c
                 if not c and email_pw:
@@ -1235,6 +2464,8 @@ async def register_one(index, total, p):
                         print(f"  [4] 主页 bring_to_front 失败(忽略): {str(e)[:60]}")
                 return c
 
+            fetch_email_code_for_reauth = _fetch_email_code
+
             async def _renavigate_resend():
                 """收不到码且页面无 Resend：回退 signup 重输邮箱重新发码（用户建议的兜底）。"""
                 print("  [4] 回退 ChatGPT signup，重输邮箱重新发码...")
@@ -1246,7 +2477,9 @@ async def register_one(index, total, p):
                     if await ei.count() == 0:
                         print("  [4] 回退后无邮箱框，放弃重发")
                         return
-                    await fill_email_verified(page, ei, email)
+                    if not await fill_email_verified(page, ei, email):
+                        print("  [4] resend email was not committed; skipping resend")
+                        return
                     await dismiss_cookie_banner(page)
                     if not await click_any_exact(page, ["Continue", "続行", "继续", "繼續", "Next", "下一步", "Teruskan"]):
                         sub = page.locator('button[type="submit"]')
@@ -1267,7 +2500,9 @@ async def register_one(index, total, p):
                     print(f"  [4] 回退重发异常: {str(e)[:80]}")
 
             code = None
-            resend_at = None  # 最近一次 resend 时刻；传给取码只收此后到的新码(旧码 resend 后失效)
+            # The first poll must also exclude codes from earlier registration
+            # attempts in the same inbox, not only codes superseded by Resend.
+            resend_at = verification_requested_at
             for code_try in range(3):
                 # 主页已关就别再空转：resend/_renavigate 都要在活页上操作，死页只会再耗 2×150s。
                 try:
@@ -1297,7 +2532,33 @@ async def register_one(index, total, p):
                 print(f"  got code: {code}")
                 await dismiss_cookie_banner(page)
                 # React 受控输入需要真实键盘事件；HTML Route Error 则点击页面上的 Retry 恢复。
-                await submit_email_verification_code(page, code_sel, code)
+                for verification_attempt in range(2):
+                    try:
+                        await submit_email_verification_code(
+                            page, code_sel, code, auth_monitor=auth_monitor
+                        )
+                        break
+                    except EmailVerificationRetryNeeded as error:
+                        if verification_attempt >= 1:
+                            raise RuntimeError(str(error)) from error
+                        print(
+                            "  [4] verification did not commit; "
+                            "requesting a fresh code..."
+                        )
+                        resend_at = time.time()
+                        if not await _click_resend_code(page):
+                            raise RuntimeError(
+                                f"{error}: resend control unavailable"
+                            ) from error
+                        code = await _fetch_email_code(
+                            received_after=resend_at,
+                            allow_browser_fallback=not has_token,
+                        )
+                        if not code:
+                            raise RuntimeError(
+                                f"{error}: fresh verification code unavailable"
+                            ) from error
+                        print(f"  [4] got fresh code: {code}")
             else:
                 print("  no code received")
                 # 收不到码：只从 chatgpt 平台拉黑（记 emails_error_chatgpt.txt），其它平台仍可取
@@ -1312,6 +2573,13 @@ async def register_one(index, total, p):
             mail_bb = mail_pid = mail_page = None
         if verification_code_failed:
             print("  [4][FAIL] verification code unavailable; stopping before onboarding")
+            return None
+        auth_url_lower = str(page.url or "").lower()
+        if any(marker in auth_url_lower for marker in (
+            "/mfa-challenge", "multi-factor", "two-factor", "authenticator"
+        )):
+            print("  [FAIL] email reached an existing-account MFA challenge; quarantining mailbox")
+            email_pool.mark_error(PLATFORM, email, email_pw, "mfa_required")
             return None
         check_timeout()
 
@@ -1330,22 +2598,73 @@ async def register_one(index, total, p):
             pass
         await dump_state(page, "final")
 
-        # 保存 cookie
-        key_val, _ = await save_platform_cookies(
-            ctx, PLATFORM, pid, email=email, password=password, key_cookie_names=KEY_COOKIES
-        )
-
-        # 导出标准 token（CPA codex / SUB2API content），失败不影响成功判定
+        # 先抓 session，再用同一登录态开启验证器 2FA。该流程会刷新
+        # session cookie，因此 cookie 必须在 2FA 完成后保存。
+        totp_secret = ""
         try:
             from common.session_export import fetch_chatgpt_session, save_chatgpt_tokens
             sess = await fetch_chatgpt_session(page)
+            if sess and ENABLE_2FA:
+                if fetch_email_code_for_reauth is None:
+                    print("  [2fa][WARN] no mailbox callback is available; skipping 2FA")
+                else:
+                    try:
+                        from common.chatgpt_2fa import enable_chatgpt_totp
+
+                        totp_secret, sess = await enable_chatgpt_totp(
+                            page,
+                            ctx,
+                            email,
+                            fetch_email_code_for_reauth,
+                        )
+                    except Exception as error:
+                        print(f"  [2fa][WARN] enable failed: {str(error)[:160]}")
+                        try:
+                            await page.goto(
+                                "https://chatgpt.com/",
+                                timeout=45000,
+                                wait_until="domcontentloaded",
+                            )
+                            await asyncio.sleep(2)
+                            refreshed = await fetch_chatgpt_session(page)
+                            if refreshed:
+                                sess = refreshed
+                        except Exception:
+                            pass
+            if sess:
+                sess["registration_country"] = _get_active_chatgpt_country() or ""
+                sess["network_node"] = chatgpt_network_label()
+                if totp_secret:
+                    sess["two_factor"] = totp_secret
+                    sess["totp_secret"] = totp_secret
+                if isinstance(mailbox, dict):
+                    sess["email_provider"] = mailbox.get("provider") or "icloud"
+                    share_url = str(
+                        mailbox.get("mail_api_url") or mailbox.get("share_url") or ""
+                    ).strip()
+                    if share_url:
+                        # Keep the URL in the session consumed by account
+                        # importers so a later manual login can read OTP mail.
+                        sess["mail_api_url"] = share_url
             if sess and save_chatgpt_tokens(sess, email):
                 print("  [OK] chatgpt 标准 token 已保存")
+                await check_chatgpt_plus_trial_after_registration(sess, email)
             else:
                 print("  [WARN] 未取到 chatgpt session（可能未完全登录）")
         except Exception as e:
             print(f"  [WARN] 保存标准 token 失败: {e}")
             sess = None
+
+        if mail_bb and mail_pid:
+            try:
+                await teardown(mail_bb, mail_pid, delete=True)
+            except Exception:
+                pass
+            mail_bb = mail_pid = mail_page = None
+
+        key_val, _ = await save_platform_cookies(
+            ctx, PLATFORM, pid, email=email, password=password, key_cookie_names=KEY_COOKIES
+        )
 
         if PLUS_SUBSCRIPTION:
             if sess:
@@ -1380,6 +2699,7 @@ async def register_one(index, total, p):
                     p=p,
                     ctx=ctx,
                     release_current=_release_registration_profile,
+                    totp_secret=totp_secret,
                 )
             except Exception as e:
                 print(f"  [codex] 异常: {str(e)[:120]}")
@@ -1407,6 +2727,27 @@ async def register_one(index, total, p):
             await teardown(bb, pid, delete=not keep)
             if keep:
                 print(f"  [debug] window kept for inspection: {name} (id={pid})")
+
+
+async def register_one_with_mailbox_retries(index, total, p):
+    """Retry iCloud allocation failures without changing the requested count."""
+    attempts = 1
+    if EMAIL_PROVIDER in {"icloud", "remail"} and not FIXED_EMAIL:
+        attempts = max(
+            1,
+            min(20, _env_int("CHATGPT_ICLOUD_MAILBOX_ATTEMPTS", 8)),
+        )
+    result = None
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            print(
+                f"  [email] retrying registration with a new iCloud mailbox "
+                f"({attempt}/{attempts})"
+            )
+        result = await register_one(index, total, p)
+        if result:
+            return result
+    return result
 
 
 async def blur_field(page, selector):
@@ -2186,13 +3527,23 @@ async def main():
     parser.add_argument("--timeout", "-t", type=int, default=480)
     parser.add_argument("--node", default="auto",
                         help="固定 ChatGPT Clash 节点；auto 自动探测，none 直连")
+    parser.add_argument(
+        "--country", default="auto",
+        help="注册出口国家：auto 或 JP/SG/US 等两位 ISO 国家码",
+    )
     parser.add_argument("--keep-on-fail", action="store_true", help="失败时保留窗口便于排查")
     parser.add_argument("--email", default=None, help="指定邮箱(绕过邮箱池)")
     parser.add_argument("--password", default=None, help="指定邮箱密码")
     parser.add_argument("--refresh-token", default=None, help="指定 Outlook refresh_token")
     parser.add_argument("--client-id", default=None, help="指定 Outlook OAuth client_id")
-    parser.add_argument("--email-provider", choices=["pool", "icloud"], default=None,
+    parser.add_argument("--email-provider", choices=["pool", "icloud", "remail"], default=None,
                         help="邮箱来源：pool=emails.txt，icloud=API 自动申请并取码")
+    two_factor = parser.add_mutually_exclusive_group()
+    two_factor.add_argument("--enable-2fa", dest="enable_2fa", action="store_true",
+                            help="注册成功后启用验证器 TOTP 并保存密钥")
+    two_factor.add_argument("--no-2fa", dest="enable_2fa", action="store_false",
+                            help="跳过注册后的验证器 TOTP")
+    parser.set_defaults(enable_2fa=None)
     parser.add_argument("--import-c2a", action="store_true",
                         help="注册成功后即时把 token 导入 chatgpt2api (POST <host>/api/accounts)")
     parser.add_argument("--plus-subscription", action="store_true",
@@ -2205,15 +3556,18 @@ async def main():
                         help="SUB2API 目标分组名 (默认取 config.SUB2API_GROUP)")
     parser.add_argument("--codex-manual-phone", action="store_true",
                         help="Codex add-phone 手动模式: 不接码, 自己在浏览器填号收码")
-    parser.add_argument("--codex-sms-provider", choices=["auto", "smsman", "firefox", "hero"], default="auto",
+    parser.add_argument("--codex-sms-provider", choices=["auto", "custom", "smsman", "firefox", "hero"], default="auto",
                         help="Codex 自动接码平台；auto 按默认顺序")
+    parser.add_argument("--codex-phone", default="",
+                        help="自定义手机号(E.164)：自动填写并等待手动输入验证码")
     parser.add_argument("--codex-timeout", type=int, default=120,
                         help="Codex 授权捕获超时秒 (手动填号会自动抬到至少 300)")
     args = parser.parse_args()
 
     global REGISTER_TIMEOUT, KEEP_ON_FAIL, FIXED_EMAIL, FIXED_PASSWORD, FIXED_REFRESH_TOKEN, FIXED_CLIENT_ID, EMAIL_PROVIDER
     global IMPORT_C2A, PLUS_SUBSCRIPTION, C2A_URL, C2A_KEY
-    global EXTRACT_CODEX, CODEX_GROUP, CODEX_MANUAL_PHONE, CODEX_SMS_PROVIDER, CODEX_TIMEOUT, CHATGPT_NODE
+    global EXTRACT_CODEX, ENABLE_2FA, CODEX_GROUP, CODEX_MANUAL_PHONE, CODEX_SMS_PROVIDER, CODEX_TIMEOUT, CHATGPT_NODE, CHATGPT_COUNTRY
+    global CODEX_PHONE
     REGISTER_TIMEOUT = args.timeout
     KEEP_ON_FAIL = args.keep_on_fail
     FIXED_EMAIL = args.email
@@ -2221,7 +3575,7 @@ async def main():
     FIXED_REFRESH_TOKEN = args.refresh_token
     FIXED_CLIENT_ID = args.client_id
     EMAIL_PROVIDER = args.email_provider or CHATGPT_EMAIL_PROVIDER or "pool"
-    if EMAIL_PROVIDER not in {"pool", "icloud"}:
+    if EMAIL_PROVIDER not in {"pool", "icloud", "remail"}:
         print(f"  [config] CHATGPT_EMAIL_PROVIDER={EMAIL_PROVIDER!r} 无效，回退 pool")
         EMAIL_PROVIDER = "pool"
     IMPORT_C2A = args.import_c2a
@@ -2229,11 +3583,14 @@ async def main():
     C2A_URL = args.c2a_url
     C2A_KEY = args.c2a_key
     EXTRACT_CODEX = args.codex
+    ENABLE_2FA = CHATGPT_ENABLE_2FA if args.enable_2fa is None else args.enable_2fa
     CODEX_GROUP = args.codex_group
     CODEX_MANUAL_PHONE = args.codex_manual_phone
+    CODEX_PHONE = args.codex_phone.strip()
     CODEX_SMS_PROVIDER = args.codex_sms_provider
     CODEX_TIMEOUT = args.codex_timeout
     CHATGPT_NODE = args.node
+    CHATGPT_COUNTRY = _normalize_chatgpt_country(args.country)
 
     if IMPORT_C2A and not ((C2A_URL or CHATGPT2API_URL) and (C2A_KEY or CHATGPT2API_KEY)):
         print("  [c2a][WARN] 已开 --import-c2a 但未配置 CHATGPT2API_URL/KEY（--c2a-url/--c2a-key 或 .env），导入会被跳过")
@@ -2242,33 +3599,62 @@ async def main():
         print("  [codex][WARN] 已开 --codex 但未配置 SUB2API_URL/EMAIL/PASSWORD（.env），Codex 提取会被跳过")
 
     try:
-        select_chatgpt_node(CHATGPT_NODE)
+        selected_node = select_chatgpt_node(CHATGPT_NODE, country=CHATGPT_COUNTRY)
+        requested_node = str(CHATGPT_NODE or "auto").strip().lower()
+        if (
+            selected_node
+            and requested_node not in {"auto", "none", "off", "direct"}
+            and proxy_switch.proxy_mode() == "clash_auto"
+        ):
+            proxy_switch.pin_fixed_node(selected_node, "chatgpt")
+            print(f"  [node] 当前批次固定节点并发: {selected_node}")
     except Exception as e:
         print(f"  [node][FAIL] {e}")
         return 2
 
-    if args.concurrency > 1:
-        print("  [node] ChatGPT 使用全局 Clash 出口，为避免注册中途换 IP，并发强制为 1")
-        args.concurrency = 1
+    from common.concurrency import build_worker_plan
+    from common.task_context import activate_worker
+
+    worker_plan = build_worker_plan("chatgpt", args.count, args.concurrency)
+    worker_plan.log()
 
     print("=" * 50)
-    print(f"  ChatGPT Auto Register  count={args.count} concurrency={args.concurrency}")
+    print(
+        f"  ChatGPT Auto Register  count={args.count} "
+        f"concurrency={worker_plan.effective_concurrency}"
+    )
     print("=" * 50)
 
-    sem = asyncio.Semaphore(args.concurrency)
+    slot_locks = [asyncio.Lock() for _ in range(worker_plan.effective_concurrency)]
     results = []
 
     async def run_one(i):
-        async with sem:
-            if i > 1:
-                await asyncio.sleep(random.uniform(2, 6) * (i - 1))
-            async with async_playwright() as p:
-                try:
-                    sk = await register_one(i, args.count, p)
-                    results.append(sk)
-                except Exception as e:
-                    print(f"  #{i} fatal: {e}")
-                    results.append(None)
+        stagger_slot = (i - 1) % worker_plan.effective_concurrency
+        if stagger_slot:
+            await asyncio.sleep(random.uniform(1.5, 3.5) * stagger_slot)
+        worker_context = worker_plan.worker(i)
+        async with slot_locks[worker_context.slot - 1]:
+            with activate_worker(worker_context) as worker:
+                _set_active_chatgpt_node(ACTIVE_CHATGPT_NODE)
+                if ACTIVE_CHATGPT_COUNTRY:
+                    _set_active_chatgpt_country(ACTIVE_CHATGPT_COUNTRY)
+                exit_country = await asyncio.to_thread(
+                    ensure_chatgpt_worker_country
+                )
+                _set_active_chatgpt_country(exit_country)
+                print(
+                    f"  [worker] {worker.worker_id} slot={worker.slot} "
+                    f"proxy={proxy_switch.current_node()} country={exit_country}"
+                )
+                async with async_playwright() as p:
+                    try:
+                        sk = await register_one_with_mailbox_retries(
+                            i, args.count, p
+                        )
+                        results.append(sk)
+                    except Exception as e:
+                        print(f"  #{i} fatal: {e}")
+                        results.append(None)
 
     await asyncio.gather(*[run_one(i) for i in range(1, args.count + 1)])
 

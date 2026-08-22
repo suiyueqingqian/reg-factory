@@ -6,14 +6,15 @@
 
 支持以下浏览器类型；外部客户端模式需要保持客户端运行：
 
-- [RuyiPage](https://github.com/LoseNine/ruyipage)：`FINGERPRINT_BROWSER=ruyipage`，默认用于 ChatGPT、Codex OAuth、GitHub 等共享浏览器流程。便携包首次启动和首次打开浏览器时会自动安装 Firefox runtime，后续版本复用 `%LOCALAPPDATA%\ruyipage\browsers`，无需重复安装。自动安装失败时可运行 WebUI 的“安装 RuyiPage Firefox”任务重试，或用 `RUYIPAGE_BROWSER_PATH` 指定已有 Firefox。
 - 内置 Chromium：`FINGERPRINT_BROWSER=bundled`，安装程序会配置浏览器路径。
 - 普通 Chrome/Chromium：`FINGERPRINT_BROWSER=custom`，通过 `CUSTOM_BROWSER_PATH` 指定可执行文件；留空时会尝试查找系统 Chrome。
 - [BitBrowser 官方下载页](https://www.bitbrowser.cn/download)：默认 API 为 `http://127.0.0.1:54345`。
 - AdsPower：默认 API 为 `http://127.0.0.1:50325`，启用鉴权时还需 API Key。
-- 其他指纹浏览器：`FINGERPRINT_BROWSER=custom_api` 并设置 `CUSTOM_BROWSER_API`；当前要求兼容 BitBrowser 的 `/browser/update|open|close|delete|list` 协议。
+- 其他指纹浏览器：`FINGERPRINT_BROWSER=custom_api` 并设置 `CUSTOM_BROWSER_API`。默认 `CUSTOM_BROWSER_API_MODE=auto` 保持 BitBrowser 兼容；对接自己的 REST API 时改为 `generic`，在 WebUI 填写 API Key、鉴权请求头以及创建/列表/启动/关闭/删除/更新路径即可。启动接口返回 `ws`、`cdp`、`endpoint` 或 `debugPort` 任一字段即可。
 
-在 `.env` 中用 `FINGERPRINT_BROWSER=ruyipage|bundled|custom|bitbrowser|adspower|custom_api` 切换。Claude、Grok 和 Outlook 的旧流程仍直接依赖 Playwright Chromium CDP；选择 RuyiPage 时这些流程自动使用 bundled Chromium，ChatGPT 与 Codex OAuth 使用 RuyiPage Firefox。
+在 `.env` 中用 `FINGERPRINT_BROWSER=bitbrowser|bundled|custom|adspower|custom_api` 切换。默认使用 BitBrowser；所有网页注册流程统一通过 Chromium CDP 自动化。
+
+`generic` 模式的最小约定：创建接口接收 `{name, remark, fingerprint, proxy}` 并返回 profile ID；列表接口返回数组或 `data.items`/`data.profiles`；启动、关闭、删除、更新接口接收配置的 `CUSTOM_BROWSER_API_ID_FIELD`（默认 `id`）。路径支持 `{id}` 和 `{profile_id}` 占位符，方法可分别配置为 GET/POST/DELETE。
 
 ### 网络出口
 
@@ -63,13 +64,19 @@ PROXY_MODE=clash_fixed
 CLASH_FIXED_NODE=美国 01
 ```
 
-Plus 提链和绑卡/支付可以分别走两个固定 Clash 出口。这里填写两个独立的 Clash 代理入口（例如分别绑定固定节点的本地监听端口），不要在并发任务运行期间切换同一个 `GLOBAL` 选择器：
-```env
-REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE=http://127.0.0.1:7901
-REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE=http://127.0.0.1:7902
+Plus Codex 导入只处理已经开通的账号，不会提取优惠链、绑卡或发起支付。每个账号登录后都会进入手机号接码验证阶段，验证成功后才继续 Codex OAuth 和 SUB2API 导入。WebUI 的 Plus 导入页支持批量账号，并可选择接码平台、换号次数、等待时间、并发数、ChatGPT 节点和 SUB2API 分组。
+
+账号行支持 Outlook、iCloud、ChatGPT session token 和完整 Codex OAuth JSON。Outlook RT 与 client_id 顺序均可，也兼容 Hotmail/Live/MSN、两段/三段记录、Tab、逗号、竖线、分号及 `email:password`：
+```text
+email@outlook.com----password----refresh_token----client_id
+email@outlook.jp----password----client_id----refresh_token
+email@hotmail.com----password----refresh_token
+email@live.jp:password
+email@icloud.com
+__Secure-next-auth.session-token=...
+{"email":"...","access_token":"...","refresh_token":"...","plan_type":"plus","codex_phone_status":"verified"}
 ```
-也可以在 WebUI 的 Plus 阶段下拉框中选择住宅 IP、Clash 当前节点或具体 Clash 节点；具体节点选择会通过 Clash 控制器锁定该阶段，两个阶段都选具体节点时会串行保护节点切换。
-未配置时，提链优先使用住宅 IP，绑卡/支付优先使用 `CLASH_PROXY`；缺少其中一种出口会自动回退到另一种。
+Outlook Graph RT/client_id 可用时优先通过 Graph 读取 OpenAI 邮箱验证码，否则使用账号密码在浏览器登录 Outlook 取码。iCloud 地址使用已配置的 `ICLOUD_MAIL_*` API。原始 ChatGPT session cookie 会先验证登录态，再走手机号验证和 Codex OAuth；普通短期 access token 不能直接换出 refresh token，会明确拒绝。完整 OAuth JSON 仅在自身带 `codex_phone_status=verified` 时允许直接导入。
 
 住宅代理支持 `http`、`https`、`socks4` 和 `socks5`；BitBrowser 窗口支持 `http`、`https` 和 `socks5`。代理池优先于单个代理；`.env` 中用逗号分隔，WebUI 中可每行填写一个：
 
@@ -109,7 +116,7 @@ cp .env.example .env
 
 真实进程环境变量优先于 `.env`。WebUI 保存配置后，新任务立即使用新值，不需要重启主服务。
 
-本地邮箱/Cookie 读取接口默认只允许回环地址调用。需要由其他本机服务统一携带密钥时，设置 `REG_FACTORY_ASSET_API_KEY`，并使用 `X-API-Key` 或 Bearer Token。ChatGPT 健康扫描默认通过 `ASSET_SCAN_CHATGPT_PLUS_TRIAL=true` 标注 Plus 免费试用资格，活动标识由 `ASSET_SCAN_CHATGPT_PLUS_CAMPAIGN` 控制；完整接口见 [本地资产 API](api.md)。
+本地邮箱/Cookie 读取接口默认只允许回环地址调用。需要由其他本机服务统一携带密钥时，设置 `REG_FACTORY_ASSET_API_KEY`，并使用 `X-API-Key` 或 Bearer Token。ChatGPT 健康扫描默认通过 `ASSET_SCAN_CHATGPT_PLUS_TRIAL=true` 标注 Plus 免费试用或明确 0 元优惠，活动标识由 `ASSET_SCAN_CHATGPT_PLUS_CAMPAIGN` 控制；完整接口见 [本地资产 API](api.md)。
 
 ## 配置分组
 
@@ -125,12 +132,13 @@ cp .env.example .env
 | 临时邮箱 | `YYDS_API_KEY` 等 provider 配置 | Claude/Grok 不使用 Outlook 池时 |
 | 接码 | `SMSMAN_*`、`SMS_API_NAME`、`SMS_TOKEN`、`HERO_SMS_*` | 手机验证；firefox.fun 使用 APIName 标识账号，token + 项目 ID 调用接口 |
 | SUB2API | `SUB2API_*` | Codex / Grok 下游导入 |
-| CPA | `CPA_URL`、`CPA_MGMT_KEY` | Codex 凭据导入 |
+| CPA | `CPA_URL`、`CPA_MGMT_KEY`、`CODEX_AUTH_URL_SOURCE` | Codex 授权地址与凭据导入 |
 | chatgpt2api | `CHATGPT2API_URL`、`CHATGPT2API_KEY` | 普通 ChatGPT 网页号导入 |
 
 密钥必须留在 `.env` 或进程环境变量中。不要把真实值写进 `.env.example`、README、测试和截图。
 
 ChatGPT 使用 iCloud 邮箱时，将 `CHATGPT_EMAIL_PROVIDER=icloud`，并填写 `ICLOUD_MAIL_API_KEY`。默认接口地址为 `https://mail.no-replyca.xyz`；`email.manageh.shop` 仅是接口文档站。`ICLOUD_MAIL_TYPE=icloud-code`、`ICLOUD_MAIL_SERVICE=openai` 用于申请 ChatGPT 接码邮箱；需要普通 iCloud 子邮箱时改用 `ICLOUD_MAIL_TYPE=icloud`，对应 `/api/user/email?type=icloud&apikey=...`。程序随后轮询 `/api/user/mail` 获取验证码。`ICLOUD_MAIL_API_BASE` 也兼容直接填写完整的 `/api/user/email?...` 地址。
+创建 iCloud 邮箱时程序会自动请求 `share=1`，并将返回的 `/api/share/{share_token}` 保存到 ChatGPT session JSON 的 `mail_api_url` 字段。该链接免 API Key，可直接查看邮箱 HTML，适合后续手动登录取码；分享链接等同于邮箱读取权限，请按敏感凭据保管。
 
 > **重要：提取 Graph RT 必须配置可接收验证码的辅助邮箱。**
 >

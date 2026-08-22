@@ -3,7 +3,7 @@
 Grok (x.ai) 自动注册 —— 纯 HTTP 协议版（集成 HM2899/grokcli-2api 的 xconsole_client）。
 
 为什么用纯 HTTP：
-  - 早期的浏览器版(BitBrowser+CDP / ruyiPage+Firefox)都卡在 accounts.x.ai 的验证码
+  - 早期的浏览器版会卡在 accounts.x.ai 的验证码
     XXX-XXX 掩码输入框——在浏览器里逐字敲会被掩码打乱、弹回 Retry。
   - 本版完全不开浏览器：用 curl_cffi 浏览器指纹直连 accounts.x.ai，走 gRPC-web 发码/验码
     + Next.js server action 建号。验证码是**字符串直传** gRPC，从根上绕开掩码输入框；
@@ -315,7 +315,11 @@ def register_one(index, total, sub2api=False, sub2api_group="", mailbox_attempts
             return None
 
         # 8. 落盘标准 grok token（{email,sso,ts}）
-        save_grok_token(sso, email)
+        save_grok_token(
+            sso,
+            email,
+            authorization_status="pending" if sub2api else "not_requested",
+        )
         print(f"  [OK] grok sso token 已保存  email={email} pw={password}")
         if sub2api:
             from common.uploaders import upload_sub2api_grok
@@ -331,6 +335,12 @@ def register_one(index, total, sub2api=False, sub2api_group="", mailbox_attempts
                 local_proxy=proxy_switch.effective_proxy_url(),
             )
             print(f"  [{'OK' if ok else 'FAIL'}] {msg}")
+            save_grok_token(
+                sso,
+                email,
+                authorization_status="authorized" if ok else "failed",
+                announce=False,
+            )
             if not ok:
                 print("  [hint] SSO 已落盘，可修复配置后运行: python tools/upload_tokens.py grok")
                 return None

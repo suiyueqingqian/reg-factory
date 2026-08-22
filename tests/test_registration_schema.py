@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import register
 from tools import validate_keys
-from webui.scripts import ENV_SCHEMA, SCRIPTS
+from webui.scripts import CHATGPT_COUNTRY_CHOICES, ENV_SCHEMA, SCRIPTS
 
 
 def _script(script_id):
@@ -11,6 +11,13 @@ def _script(script_id):
 
 
 class RegistrationSchemaTests(unittest.TestCase):
+    def test_every_environment_variable_has_chinese_label_and_help(self):
+        for group in ENV_SCHEMA:
+            for item in group["items"]:
+                self.assertTrue(item.get("label"), item["key"])
+                self.assertTrue(item.get("help"), item["key"])
+                self.assertRegex(item["label"], r"[\u4e00-\u9fff]", item["key"])
+
     def test_claude_validator_reuses_clash_and_modern_fingerprint(self):
         with patch.dict(
             validate_keys.os.environ,
@@ -63,8 +70,99 @@ class RegistrationSchemaTests(unittest.TestCase):
     def test_chatgpt_exposes_fixed_node(self):
         args = {item["flag"]: item for item in _script("register_chatgpt")["args"]}
         self.assertEqual(args["--node"]["default"], "auto")
+        self.assertEqual(args["--country"]["default"], "auto")
+        self.assertIn("JP", args["--country"]["choices"])
+        for script_id in ("run_full_flow", "register_three_platforms"):
+            flow_args = {
+                item["flag"]: item for item in _script(script_id)["args"]
+            }
+            self.assertEqual(flow_args["--chatgpt-country"]["default"], "auto")
         oauth_args = {item["flag"]: item for item in _script("oauth_codex")["args"]}
         self.assertEqual(oauth_args["--node"]["default"], "auto")
+
+    def test_chatgpt_country_picker_exposes_complete_iso_list(self):
+        self.assertEqual(len(CHATGPT_COUNTRY_CHOICES), 250)
+        self.assertEqual(len(set(CHATGPT_COUNTRY_CHOICES)), 250)
+        for country in ("AE", "BR", "IN", "JP", "ZA"):
+            self.assertIn(country, CHATGPT_COUNTRY_CHOICES)
+        for script_id, flag in (
+            ("run_full_flow", "--chatgpt-country"),
+            ("register_three_platforms", "--chatgpt-country"),
+            ("register_chatgpt", "--country"),
+        ):
+            args = {item["flag"]: item for item in _script(script_id)["args"]}
+            self.assertIs(args[flag]["choices"], CHATGPT_COUNTRY_CHOICES)
+            self.assertTrue(args[flag]["countryNames"])
+
+    def test_end_to_end_exposes_concurrent_parallel_pipeline(self):
+        args = {item["flag"]: item for item in _script("run_full_flow")["args"]}
+        self.assertEqual(args["--concurrency"]["default"], 1)
+        self.assertFalse(args["--sequential-platforms"]["default"])
+        self.assertEqual(args["--platform-retries"]["default"], 0)
+        self.assertIn("github", args["--platforms"]["choices"])
+        consumer_args = {
+            item["flag"]: item
+            for item in _script("register_three_platforms")["args"]
+        }
+        self.assertIn("--max-inflight", consumer_args)
+        self.assertIn("github", consumer_args["--platforms"]["choices"])
+
+    def test_end_to_end_exposes_complete_stage_tuning(self):
+        flow_args = {
+            item["flag"]: item for item in _script("run_full_flow")["args"]
+        }
+        expected = {
+            "--platform-retries",
+            "--round-sleep",
+            "--email-timeout",
+            "--email-total-timeout",
+            "--max-press",
+            "--broker",
+            "--grok-timeout",
+            "--keep-on-fail",
+            "--claude-profile-retries",
+            "--claude-hcaptcha-retries",
+            "--claude-challenge-wait",
+            "--claude-challenge-node-retries",
+            "--claude-captcha-manual-timeout",
+            "--codex-sms-provider",
+            "--custom-sms-pool-file",
+            "--custom-sms-allowed-hosts",
+            "--codex-phone-skip",
+            "--codex-phone-attempts",
+            "--codex-sms-timeout",
+            "--sms-get-phone-retries",
+            "--codex-timeout",
+            "--grok-mailbox-attempts",
+            "--kiro-account-password",
+            "--kiro-full-name",
+            "--plus-subscription",
+            "--proxy",
+            "--clash-api",
+            "--clash-secret",
+            "--clash-group",
+        }
+        self.assertTrue(expected.issubset(flow_args))
+        self.assertIn("custom", flow_args["--codex-sms-provider"]["choices"])
+        self.assertIn("批量导入", flow_args["--custom-sms-pool-file"]["help"])
+        self.assertIn("白名单", _script("run_full_flow").get("desc", "") + flow_args["--custom-sms-allowed-hosts"]["help"])
+
+        consumer_args = {
+            item["flag"]: item
+            for item in _script("register_three_platforms")["args"]
+        }
+        stage_b_expected = expected - {
+            "--round-sleep",
+            "--email-timeout",
+            "--email-total-timeout",
+            "--max-press",
+            "--proxy",
+            "--clash-api",
+            "--clash-secret",
+            "--clash-group",
+        }
+        self.assertTrue(stage_b_expected.issubset(consumer_args))
+        self.assertIn("custom", consumer_args["--codex-sms-provider"]["choices"])
 
     def test_chatgpt_promotes_direct_sub2api_import(self):
         script = _script("register_chatgpt")
@@ -75,18 +173,35 @@ class RegistrationSchemaTests(unittest.TestCase):
         self.assertIn("--codex", primary_flags)
         self.assertIn("SUB2API", args["--codex"]["help"])
         self.assertIn("--codex-group", args)
+        self.assertIn("custom", args["--codex-sms-provider"]["choices"])
+        self.assertIn("--codex-phone", args)
 
-    def test_ruyipage_is_the_default_browser(self):
+        oauth_args = {item["flag"]: item for item in _script("oauth_codex")["args"]}
+        self.assertIn("custom", oauth_args["--sms-provider"]["choices"])
+
+    def test_bitbrowser_is_the_default_browser(self):
         browser_group = next(
             group for group in ENV_SCHEMA if group["group"] == "指纹浏览器"
         )
         items = {item["key"]: item for item in browser_group["items"]}
 
-        self.assertEqual(items["FINGERPRINT_BROWSER"]["default"], "ruyipage")
+        self.assertEqual(items["FINGERPRINT_BROWSER"]["default"], "bitbrowser")
+        self.assertNotIn("advanced", items["CUSTOM_BROWSER_API"])
+        self.assertNotIn("advanced", items["CUSTOM_BROWSER_API_MODE"])
+        self.assertNotIn("advanced", items["CUSTOM_BROWSER_API_KEY"])
+        self.assertTrue(items["CUSTOM_BROWSER_API_CREATE_PATH"]["advanced"])
+        self.assertTrue(items["CUSTOM_BROWSER_API_OPEN_METHOD"]["advanced"])
         self.assertEqual(
-            items["FINGERPRINT_BROWSER"]["choices"][0], "ruyipage"
+            items["FINGERPRINT_BROWSER"]["choices"][0], "bitbrowser"
         )
-        self.assertIn("RUYIPAGE_BROWSER_PATH", items)
+
+    def test_browser_task_warnings_describe_chromium_provider(self):
+        outlook_warning = _script("outlook_reg_loop").get("warning", "")
+        self.assertIn("Chromium", outlook_warning)
+        self.assertIn("BitBrowser", outlook_warning)
+        for script_id in ("register_claude", "register_grok"):
+            warning = _script(script_id).get("warning", "")
+            self.assertIn("Chromium CDP", warning)
 
     def test_claude_defaults_to_latest_rt(self):
         args = {item["flag"]: item for item in _script("register_claude")["args"]}

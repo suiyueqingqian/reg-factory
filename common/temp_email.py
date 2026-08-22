@@ -5,12 +5,13 @@ common/temp_email.py — 临时邮箱统一接口（纯 HTTP API 取验证码）
 参考 grokcli-2api（HM2899/grokcli-2api）：用临时邮箱 HTTP API 直接拉验证码，
 免去 Outlook 浏览器登录 + 收件箱轮询的重开销，取码从 ~80-120s 降到 ~10-30s。
 
-支持 5 个 provider：
+支持 7 个 provider：
   - moemail : beilunyang/moemail（自部署）           X-API-Key
   - yyds    : YYDS Mail (vip.215.im / maliapi.215.im) X-API-Key(AC-...) / Bearer token
   - gptmail : mail.chatgpt.org.uk（含公共测试 key）   X-API-Key(gpt-test)
   - cfmail  : dreamhunter2333/cloudflare_temp_email   x-admin-auth / Bearer jwt
   - icloud  : mail.no-replyca.xyz（iCloud / iCloud code） URL query apikey
+  - remail   : remail.aishop6.com（Remail 开放 API，Bearer rk-...）
 
 统一接口：
   create_mailbox(provider=...) -> {"id","email","token","provider","raw"}
@@ -29,7 +30,8 @@ import re
 import string
 import sys
 import time
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+import uuid
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -43,6 +45,7 @@ try:
         MOEMAIL_BASE_URL, MOEMAIL_API_KEY, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS,
         YYDS_BASE_URL, YYDS_API_KEY,
         GPTMAIL_BASE_URL, GPTMAIL_API_KEY,
+        REMAIL_BASE_URL, REMAIL_API_KEY, REMAIL_PROJECT_ID, REMAIL_EMAIL_SUFFIX, REMAIL_SUPPLY,
         CFMAIL_BASE_URL, CFMAIL_ADMIN_PASSWORD, CFMAIL_SITE_PASSWORD,
         CUSTOM_MAIL_BASE_URL, CUSTOM_MAIL_AUTH_HEADER, CUSTOM_MAIL_API_KEY,
         CUSTOM_MAIL_AUTH_PREFIX, CUSTOM_MAIL_CREATE_METHOD, CUSTOM_MAIL_CREATE_PATH,
@@ -62,6 +65,9 @@ except Exception:  # pragma: no cover - config 缺失时的兜底默认
     YYDS_API_KEY = ""
     GPTMAIL_BASE_URL = "https://mail.chatgpt.org.uk"
     GPTMAIL_API_KEY = "gpt-test"
+    REMAIL_BASE_URL = "https://remail.aishop6.com"
+    REMAIL_API_KEY = REMAIL_EMAIL_SUFFIX = REMAIL_SUPPLY = ""
+    REMAIL_PROJECT_ID = 0
     CFMAIL_BASE_URL = "https://temp-email-api.awsl.uk"
     CFMAIL_ADMIN_PASSWORD = CFMAIL_SITE_PASSWORD = ""
     CUSTOM_MAIL_BASE_URL = CUSTOM_MAIL_AUTH_HEADER = CUSTOM_MAIL_API_KEY = ""
@@ -184,7 +190,7 @@ def normalize_provider(provider=None, base_url=""):
     """归一化 provider 名：moemail | yyds | gptmail | cfmail | icloud | custom。
     provider 显式给出优先；否则从 base_url 域名特征推断；再兜底 config 默认。"""
     p = (provider or "").strip().lower()
-    if p in ("moemail", "yyds", "gptmail", "cfmail", "icloud", "custom"):
+    if p in ("moemail", "yyds", "gptmail", "cfmail", "icloud", "remail", "custom"):
         return p
     b = (base_url or "").lower()
     # base_url 命中自定义 API 根地址 → custom
@@ -200,8 +206,10 @@ def normalize_provider(provider=None, base_url=""):
         return "cfmail"
     if "no-replyca" in b or "manageh.shop" in b:
         return "icloud"
+    if "remail.aishop6.com" in b:
+        return "remail"
     dflt = (TEMP_EMAIL_PROVIDER or "gptmail").strip().lower()
-    return dflt if dflt in ("moemail", "yyds", "gptmail", "cfmail", "icloud") else "gptmail"
+    return dflt if dflt in ("moemail", "yyds", "gptmail", "cfmail", "icloud", "remail") else "gptmail"
 
 
 def _norm_base(base_url, default):
@@ -542,21 +550,31 @@ def _icloud_base_and_query(base_url):
     return root, query
 
 
-def _icloud_create(name, domain, expiry_ms, api_key, base_url, sess):
+def _icloud_create(
+    name, domain, expiry_ms, api_key, base_url, sess, *, mail_type=None, service=None
+):
     """Allocate an iCloud address from the provider's GET-only API."""
     base, pasted_query = _icloud_base_and_query(base_url)
     key = (api_key or pasted_query.get("apikey") or ICLOUD_MAIL_API_KEY or "").strip()
     if not key:
         raise ValueError("iCloud Mail 需要 API key（ICLOUD_MAIL_API_KEY）")
-    kind = (pasted_query.get("type") or ICLOUD_MAIL_TYPE or "icloud-code").strip().lower()
+    kind = (
+        mail_type or pasted_query.get("type") or ICLOUD_MAIL_TYPE or "icloud-code"
+    ).strip().lower()
     if kind not in {"icloud", "icloud-code"}:
         raise ValueError("ICLOUD_MAIL_TYPE 只能是 icloud 或 icloud-code")
-    params = {"type": kind, "apikey": key}
+    # Ask the provider for a keyless share URL so the mailbox can be reused
+    # for later manual login or account imports.
+    params = {"type": kind, "apikey": key, "share": "1"}
     if kind == "icloud-code":
-        service = (pasted_query.get("service") or ICLOUD_MAIL_SERVICE or "openai").strip().lower()
-        if not service:
+        code_service = (
+            service or pasted_query.get("service") or ICLOUD_MAIL_SERVICE or "openai"
+        ).strip().lower()
+        if not code_service:
             raise ValueError("icloud-code 需要 ICLOUD_MAIL_SERVICE")
-        params["service"] = service
+        params["service"] = code_service
+    else:
+        code_service = ""
     response = sess.get(f"{base}/api/user/email", params=params, timeout=HTTP_TIMEOUT)
     if response.status_code >= 400:
         raise _icloud_error(response, "create")
@@ -565,17 +583,87 @@ def _icloud_create(name, domain, expiry_ms, api_key, base_url, sess):
     address = (body.get("email") or body.get("address")) if isinstance(body, dict) else None
     if not address or "@" not in str(address):
         raise RuntimeError(f"iCloud Mail create 返回异常: {str(data)[:220]}")
+    share_token = ""
+    share_url = ""
+    for source in (body, data):
+        if not isinstance(source, dict):
+            continue
+        if not share_token:
+            share_token = str(
+                source.get("share_token") or source.get("shareToken") or ""
+            ).strip()
+        if not share_url:
+            share_url = str(
+                source.get("share_url")
+                or source.get("shareUrl")
+                or source.get("share_link")
+                or source.get("shareLink")
+                or ""
+            ).strip()
+    if share_token:
+        share_url = f"{base}/api/share/{quote(share_token, safe='')}"
+    elif share_url.startswith("/"):
+        share_url = f"{base}{share_url}"
     return {
         "id": str(address),
         "email": str(address),
         "token": "",
         "provider": "icloud",
+        "mail_type": kind,
+        "service": code_service,
+        "share_token": share_token,
+        "share_url": share_url,
+        # Existing account importers use this canonical field for iCloud URLs.
+        "mail_api_url": share_url,
         "raw": data,
     }
 
 
 def _icloud_fetch(mailbox_id, email, token, api_key, base_url, sess):
     """Query the latest message; an empty success response means no mail yet."""
+    raw_url = _norm_base(base_url, "") if base_url else ""
+    raw_path = urlsplit(raw_url).path.lower() if raw_url else ""
+    # Some mailbox vendors issue a per-address read URL (/s/<secret>/<email>)
+    # or a keyless share URL (/api/share/<share_token>) instead of the
+    # configurable /api/user/mail endpoint. Preserve that URL verbatim so its
+    # embedded secret is never reinterpreted as an API key.
+    if raw_url and ("/s/" in raw_path or "/api/share/" in raw_path):
+        # Per-address pages are frequently CDN-cached; a resend must expose
+        # the newly delivered message instead of the prior HTML snapshot.
+        response = sess.get(
+            raw_url,
+            headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if response.status_code >= 400:
+            raise _icloud_error(response, "fetch")
+        if not response.content:
+            return []
+        try:
+            data = response.json()
+        except (TypeError, ValueError):
+            # Per-account links from some providers return an HTML/plain-text
+            # mailbox view instead of JSON; the unified poller can still scan it.
+            return [{"text": response.text or ""}]
+        if isinstance(data, dict) and data.get("code") == 0 and "data" not in data:
+            return []
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        if isinstance(body, dict):
+            for key in ("messages", "mails", "mail", "items", "results", "content"):
+                if isinstance(body.get(key), list):
+                    body = body[key]
+                    break
+        if not body:
+            return []
+        if isinstance(body, list):
+            return [
+                dict(item) if isinstance(item, dict) else {"text": str(item)}
+                for item in body
+                if isinstance(item, (dict, str))
+            ]
+        if isinstance(body, dict):
+            return [dict(body)]
+        return []
     base, pasted_query = _icloud_base_and_query(base_url)
     key = (api_key or pasted_query.get("apikey") or ICLOUD_MAIL_API_KEY or "").strip()
     address = (email or mailbox_id or "").strip()
@@ -599,6 +687,73 @@ def _icloud_fetch(mailbox_id, email, token, api_key, base_url, sess):
     if isinstance(body, dict):
         return [dict(body)]
     return []
+
+
+# ==================================================================== Remail Open API
+def _remail_base(base_url=None):
+    return _norm_base(base_url, REMAIL_BASE_URL)
+
+
+def _remail_headers(api_key):
+    key = str(api_key or REMAIL_API_KEY or "").strip()
+    if not key:
+        raise ValueError("Remail 需要 API key（REMAIL_API_KEY，rk- 开头）")
+    return {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+
+
+def _remail_create(name, domain, expiry_ms, api_key, base_url, sess):
+    """Create a short-lived Remail code order and normalize its service token."""
+    base = _remail_base(base_url)
+    headers = _remail_headers(api_key)
+    project_id = int(REMAIL_PROJECT_ID or 0)
+    if not project_id:
+        raise ValueError("Remail 需要 REMAIL_PROJECT_ID（在 /v1/open/projects 选择启用 code 的项目）")
+    suffix = str(domain or REMAIL_EMAIL_SUFFIX or "outlook.com").strip()
+    supply = str(REMAIL_SUPPLY or "private_first").strip() or "private_first"
+    response = sess.post(
+        f"{base}/v1/open/orders?serviceMode=code&supply={quote(supply, safe='')}",
+        json={"projectId": project_id, "emailSuffix": suffix},
+        headers={**headers, "Content-Type": "application/json", "Idempotency-Key": str(uuid.uuid4())},
+        timeout=HTTP_TIMEOUT,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Remail create {response.status_code}: {response.text[:220]}")
+    data = response.json() if response.content else {}
+    body = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Remail create 返回异常: {str(data)[:220]}")
+    email = str(body.get("deliveryEmail") or body.get("email") or "").strip()
+    service_token = str(body.get("serviceToken") or body.get("token") or "").strip()
+    if not email or "@" not in email or not service_token:
+        raise RuntimeError(f"Remail create 缺少 deliveryEmail/serviceToken: {str(data)[:220]}")
+    order_id = body.get("id") or body.get("orderNo") or email
+    return {
+        "id": str(order_id), "email": email, "token": service_token,
+        "provider": "remail", "api_key": str(api_key or REMAIL_API_KEY or ""),
+        "base_url": base, "raw": data,
+    }
+
+
+def _remail_fetch(mailbox_id, email, token, api_key, base_url, sess):
+    """Read Remail's short-lived inbox; bodyPreview is enough for OTP extraction."""
+    address = str(email or "").strip()
+    service_token = str(token or "").strip()
+    if not address or not service_token:
+        return []
+    response = sess.get(
+        f"{_remail_base(base_url)}/v1/pickup",
+        params={"email": address, "token": service_token},
+        headers=_remail_headers(api_key), timeout=HTTP_TIMEOUT,
+    )
+    if response.status_code >= 400:
+        detail = (response.text or "").strip()[:220]
+        raise RuntimeError(f"Remail fetch {response.status_code}: {detail}")
+    data = response.json() if response.content else {}
+    body = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    if not isinstance(body, dict):
+        return []
+    items = body.get("items") if isinstance(body.get("items"), list) else []
+    return [dict(item) for item in items[:20] if isinstance(item, dict)]
 
 
 # ==================================================================== Cloudflare Temp Email
@@ -774,6 +929,7 @@ _CREATE = {
     "yyds": _yyds_create,
     "gptmail": _gptmail_create,
     "icloud": _icloud_create,
+    "remail": _remail_create,
     "cfmail": _cfmail_create,
     "custom": _custom_create,
 }
@@ -782,6 +938,7 @@ _FETCH = {
     "yyds": _yyds_fetch,
     "gptmail": _gptmail_fetch,
     "icloud": _icloud_fetch,
+    "remail": _remail_fetch,
     "cfmail": _cfmail_fetch,
     "custom": _custom_fetch,
 }
@@ -809,7 +966,7 @@ def _provider_list(provider=None):
 
 
 def create_mailbox(provider=None, name=None, domain=None, expiry_ms=None,
-                   api_key=None, base_url=None):
+                   api_key=None, base_url=None, mail_type=None, service=None):
     """创建临时邮箱。返回 {"id", "email", "token", "provider", "raw"}。
     provider 为空时用 config.TEMP_EMAIL_PROVIDER，支持逗号分隔的多 provider 故障转移：
     按序尝试，第一个建号成功的即返回；全失败才抛异常（把各家错误合并抛出）。
@@ -820,7 +977,8 @@ def create_mailbox(provider=None, name=None, domain=None, expiry_ms=None,
         fn = _CREATE.get(prov)
         if not fn:
             raise ValueError(f"未知临时邮箱 provider: {prov}")
-        return fn(name, domain, expiry_ms, api_key, base_url, _session())
+        kwargs = {"mail_type": mail_type, "service": service} if prov == "icloud" else {}
+        return fn(name, domain, expiry_ms, api_key, base_url, _session(), **kwargs)
     provs = _provider_list(provider)
     errors = []
     for prov in provs:
@@ -829,7 +987,8 @@ def create_mailbox(provider=None, name=None, domain=None, expiry_ms=None,
             errors.append(f"{prov}: 未知 provider")
             continue
         try:
-            mb = fn(name, domain, expiry_ms, None, None, _session())
+            kwargs = {"mail_type": mail_type, "service": service} if prov == "icloud" else {}
+            mb = fn(name, domain, expiry_ms, None, None, _session(), **kwargs)
             if len(provs) > 1:
                 print(f"  [temp-email] provider={prov} 建号成功（候选 {provs}）")
             return mb
@@ -852,7 +1011,8 @@ def fetch_messages(mailbox_id, provider, email=None, token=None,
     for m in msgs:
         text = "\n".join(str(m.get(k) or "") for k in (
             "subject", "content", "text", "textBody", "html", "htmlBody",
-            "body", "from_address", "from", "sender", "verificationCode", "code"))
+            "body", "bodyPreview", "from_address", "from", "sender",
+            "verificationCode", "code"))
         ex = _extract_codes_and_links(text)
         # YYDS 服务端直接给 verificationCode 字段时优先采信
         vc = m.get("verificationCode")
@@ -866,11 +1026,24 @@ def _hit(msg, sender_hint, subject_hint):
     """邮件是否命中发件人/主题提示（宽松：任一命中即算；两个 hint 都空则全放行）。"""
     if not sender_hint and not subject_hint:
         return True
-    frm = " ".join(str(msg.get(k) or "") for k in ("from_address", "from", "sender")).lower()
-    subj = str(msg.get("subject") or "").lower()
+    frm = " ".join(
+        str(msg.get(k) or "") for k in ("from_address", "from", "sender")
+    ).lower().strip()
+    subj = str(msg.get("subject") or "").lower().strip()
     hit_s = any(s.lower() in frm for s in sender_hint) if sender_hint else False
     hit_j = any(s.lower() in subj for s in subject_hint) if subject_hint else False
-    return hit_s or hit_j
+    if hit_s or hit_j:
+        return True
+    # Per-address mailbox links can return a rendered HTML page instead of a
+    # structured message. In that case the visible body still contains the
+    # sender and subject, so use it as the filtering fallback.
+    if not frm and not subj:
+        body = " ".join(
+            str(msg.get(k) or "")
+            for k in ("content", "text", "textBody", "html", "htmlBody", "body")
+        ).lower()
+        return any(str(hint).lower() in body for hint in (*sender_hint, *subject_hint))
+    return False
 
 
 def _scan_once(mailbox_id, provider, email, token, api_key, base_url,
@@ -888,14 +1061,30 @@ def _scan_once(mailbox_id, provider, email, token, api_key, base_url,
         if not _hit(m, sender_hint, subject_hint):
             continue
         if pat:
-            # 自定义正则：在主题+正文里找（剥 HTML 避免命中 hex 色值）
-            for text in (str(m.get("subject") or ""),
-                         _strip_html(str(m.get("html") or m.get("htmlBody") or "")),
-                         str(m.get("text") or m.get("textBody") or m.get("content") or "")):
+            # A caller-supplied pattern is a hard constraint. Do not fall back
+            # to generic dashed-code extraction, which can match HTML/CSS text.
+            candidates = []
+            for field in (
+                "subject", "html", "htmlBody", "text", "textBody", "content",
+                "body", "bodyPreview",
+            ):
+                value = str(m.get(field) or "")
+                if "<" in value:
+                    value = re.sub(
+                        r"(?is)<(style|script|head|svg)\b[^>]*>.*?</\1\s*>",
+                        " ",
+                        value,
+                    )
+                    value = _strip_html(value)
+                candidates.append(value)
+            for field in ("verificationCode", "code"):
+                candidates.append(str(m.get(field) or ""))
+            for text in candidates:
                 for mm in pat.finditer(text):
                     code = next((g for g in mm.groups() if g), mm.group(0))
                     if str(code) not in excluded:
                         return code
+            continue
         codes = m.get("extracted", {}).get("codes") or []
         code = next((code for code in codes if str(code) not in excluded), None)
         if code:
@@ -920,7 +1109,7 @@ async def poll_verification_code(mailbox_id, provider, email=None, token=None,
             None, _scan_once, mailbox_id, provider, email, token, api_key, base_url,
             tuple(sender_hint), tuple(subject_hint), code_regex, tuple(exclude_codes))
         if code:
-            print(f"  [temp-email] code found: {code}")
+            print("  [temp-email] code found: ******")
             return code
         elapsed = int(time.time() - start)
         print(f"  [temp-email] waiting for code... ({elapsed}s/{max_wait}s)")
@@ -943,7 +1132,7 @@ def poll_verification_code_blocking(mailbox_id, provider, email=None, token=None
             tuple(exclude_codes),
         )
         if code:
-            print(f"  [temp-email] code found: {code}")
+            print("  [temp-email] code found: ******")
             return code
         elapsed = int(time.time() - start)
         print(f"  [temp-email] waiting for code... ({elapsed}s/{max_wait}s)")
@@ -960,6 +1149,8 @@ def _provider_config(prov):
         return YYDS_BASE_URL, bool(YYDS_API_KEY or MOEMAIL_API_KEY), "YYDS_API_KEY"
     if prov == "gptmail":
         return GPTMAIL_BASE_URL, True, "GPTMAIL_API_KEY(或公共 gpt-test)"
+    if prov == "remail":
+        return REMAIL_BASE_URL, bool(REMAIL_API_KEY), "REMAIL_API_KEY"
     if prov == "icloud":
         # A complete endpoint may carry apikey in its query string.  Return
         # only the normalized root so doctor output never prints that secret.
@@ -977,7 +1168,7 @@ def _provider_config(prov):
 def doctor(providers=None):
     """连通性自测：逐个 provider 检查 域名目录可达 + 建号可用。
     不轮询收码（那要真发信）。返回 [(prov, ok, detail)]，并打印人类可读报告。"""
-    provs = _provider_list(providers) if providers else ["moemail", "yyds", "gptmail", "cfmail", "icloud", "custom"]
+    provs = _provider_list(providers) if providers else ["moemail", "yyds", "gptmail", "cfmail", "icloud", "remail", "custom"]
     print("=" * 56)
     print(f"  临时邮箱连通性自测  providers={provs}")
     print("=" * 56)
@@ -996,6 +1187,8 @@ def doctor(providers=None):
                 dom = _gptmail_pick_domain(GPTMAIL_API_KEY, _norm_base(None, GPTMAIL_BASE_URL), sess)
             elif prov == "cfmail":
                 dom = _cfmail_pick_domain(_norm_base(None, CFMAIL_BASE_URL), sess, CFMAIL_SITE_PASSWORD)
+            elif prov == "remail":
+                print("  项目: 使用 REMAIL_PROJECT_ID 选择的 code 项目")
             if prov == "custom":
                 # custom 无公开域名目录；改为检查关键配置是否填齐
                 miss = [n for n, v in (("CUSTOM_MAIL_BASE_URL", CUSTOM_MAIL_BASE_URL),

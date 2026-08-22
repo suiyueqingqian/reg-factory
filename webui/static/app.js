@@ -7,10 +7,10 @@ let evtSrc = null;     // EventSource
 let smsTimer = null;   // 接码助手倒计时刷新
 let k12Url = 'http://127.0.0.1:8806/';
 let k12Starting = false;
-let plusUrl = '/chatgpt-plus/';
-const PLUS_BATCH_SIZE = 27;
-const PLUS_IMPORT_LIMIT = 100;
-let plusImporting = false;
+let plusRun = null;
+let plusEventSource = null;
+let plusAfterImport = null;
+let plusProtocolStatus = null;
 let proxyMode = 'clash_auto';
 let assetPickMode = 'sequence';
 let assetScanData = null;
@@ -24,6 +24,8 @@ let guideTarget = null;
 let guidePositionFrame = null;
 let scriptsReady = null;
 let guideOriginalProxyMode = null;
+const initializedViews = new Set(['run']);
+const scriptDrafts = new Map();
 
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => [...r.querySelectorAll(s)];
@@ -79,11 +81,12 @@ function renderUpdateState(update, version){
     return;
   }
   if(updateRequested && update && update.status === 'completed'){
+    updateRequested = false;
     button.classList.remove('running');
-    button.disabled = true;
-    label.textContent = '更新完成';
-    setUpdateMessage('面板正在重启…', 'ok');
-    setTimeout(()=>location.reload(), 900);
+    button.disabled = false;
+    const message = update.message || '更新检查完成';
+    label.textContent = message.includes('已是最新') ? '已是最新' : '更新完成';
+    setUpdateMessage(message, 'ok');
     return;
   }
   button.disabled = updateRequested || !available;
@@ -103,15 +106,12 @@ function renderUpdateState(update, version){
 async function pollStatus(){
   try{
     const s = await (await fetch('/api/status')).json();
-    const browserRuntime = s.browser_runtime || {};
-    $('#dot-bb').classList.toggle('pending', browserRuntime.state === 'installing');
+    $('#dot-bb').classList.remove('pending');
     $('#dot-bb').classList.toggle('on', s.bitbrowser);
-    const browserLabels = {ruyipage:'RuyiPage Firefox', adspower:'AdsPower', bundled:'内置浏览器', custom:'自定义 Chrome', custom_api:'自定义指纹浏览器'};
+    const browserLabels = {adspower:'AdsPower', bundled:'内置浏览器', custom:'自定义 Chrome', custom_api:'自定义指纹浏览器'};
     let label = browserLabels[s.browser_provider] || 'BitBrowser';
-    if(s.browser_provider === 'ruyipage' && browserRuntime.state === 'installing') label = 'RuyiPage 安装中';
-    else if(s.browser_provider === 'ruyipage' && browserRuntime.state === 'failed') label = 'RuyiPage 安装失败';
     $('#browser-label').textContent = label;
-    $('#browser-label').title = browserRuntime.message || label;
+    $('#browser-label').title = label;
     const networkOnline = s.network ?? s.clash;
     $('#dot-clash').classList.toggle('on', !!networkOnline);
     const modeLabels = {clash_auto:'Clash 自动', clash_fixed:'Clash 固定', residential:'住宅代理', direct:'直连'};
@@ -179,16 +179,27 @@ async function showView(v){
   $('#view-embed').style.display = v==='embed' ? 'block' : 'none';
   $('#view-mailpool').style.display = v==='mailpool' ? 'block' : 'none';
   $('#view-k12').style.display = v==='k12' ? 'block' : 'none';
-  $('#view-plus').style.display = v==='plus' ? 'block' : 'none';
+  $('#view-plus').style.display = v==='plus' ? 'flex' : 'none';
   $$('.navbtn').forEach(b=>b.classList.toggle('active', b.dataset.view===v));
   if(v!=='run' && v!=='embed') $$('.scriptbtn').forEach(b=>b.classList.remove('active'));
-  if(v==='env') return loadEnv();
-  if(v==='assets') return loadAssetPanel();
-  if(v==='network') return loadProxyPanel();
-  if(v==='mailpool') return loadMailpool();
-  if(v==='k12') return openK12Channel();
-  if(v==='plus'){ loadPlusAtCount(); return openPlusChannel(); }
-  return Promise.resolve();
+  if(initializedViews.has(v)) return Promise.resolve();
+  const loaders = {
+    env:loadEnv,
+    assets:loadAssetPanel,
+    network:loadProxyPanel,
+    mailpool:loadMailpool,
+    k12:openK12Channel,
+    plus:loadPlusImportStatus,
+  };
+  const loader = loaders[v];
+  if(!loader) return Promise.resolve();
+  initializedViews.add(v);
+  try{
+    return await loader();
+  }catch(error){
+    initializedViews.delete(v);
+    throw error;
+  }
 }
 $$('.navbtn').forEach(b=> b.onclick = ()=> showView(b.dataset.view));
 
@@ -241,23 +252,6 @@ function escapeHtml(value){
   }[char]));
 }
 
-function renderPlusRouteOptions(id, nodes, selected, fallback){
-  const select = $(id);
-  if(!select) return;
-  const values = [
-    {value:'residential', label:'住宅 IP'},
-    {value:'clash', label:'Clash 当前节点'},
-    ...(nodes || []).map(node=>({value:`clash:${node}`, label:`Clash：${node}`})),
-  ];
-  const known = new Set(values.map(item=>item.value));
-  if(selected && !known.has(selected) && selected.startsWith('clash:')){
-    values.push({value:selected, label:`Clash：${selected.slice(6)}`});
-  }
-  select.innerHTML = values.map(item=>`<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join('');
-  select.value = selected || fallback;
-  if(!select.value) select.value = fallback;
-}
-
 async function loadProxyPanel(includeNodes=false){
   setProxyMessage('读取中…');
   try{
@@ -270,26 +264,18 @@ async function loadProxyPanel(includeNodes=false){
     $('#proxy-clash-secret').value = config.CLASH_SECRET || '';
     $('#proxy-clash-proxy').value = config.CLASH_PROXY || '';
     $('#proxy-clash-group').value = config.CLASH_GROUP || '';
-    const residentialConfigured = Boolean(config.REG_FACTORY_PROXY || config.REG_FACTORY_PROXY_POOL);
-    renderPlusRouteOptions(
-      '#proxy-plus-link-route',
-      data.nodes,
-      config.REG_FACTORY_PLUS_LINK_ROUTE || (residentialConfigured ? 'residential' : 'clash'),
-      residentialConfigured ? 'residential' : 'clash',
-    );
-    renderPlusRouteOptions(
-      '#proxy-plus-bind-route',
-      data.nodes,
-      config.REG_FACTORY_PLUS_BIND_ROUTE || 'clash',
-      'clash',
-    );
-    $('#proxy-plus-link-proxy').value = config.REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE || '';
-    $('#proxy-plus-bind-proxy').value = config.REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE || '';
     $('#proxy-residential-url').value = config.REG_FACTORY_PROXY || '';
     $('#proxy-residential-pool').value = config.REG_FACTORY_PROXY_POOL || '';
+    $('#proxy-plus-link-override').value = config.REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE || '';
+    $('#proxy-plus-bind-override').value = config.REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE || '';
     $('#proxy-rotate-url').value = config.REG_FACTORY_PROXY_ROTATE_URL || '';
     $('#proxy-rotate-method').value = config.REG_FACTORY_PROXY_ROTATE_METHOD || 'GET';
     $('#proxy-chatgpt-retries').value = config.CHATGPT_RESIDENTIAL_ROTATE_RETRIES || '3';
+    $('#proxy-traffic-mode').value = config.REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE || 'balanced';
+    $('#proxy-max-concurrency').value = config.REG_FACTORY_MAX_CONCURRENCY || '10';
+    $('#proxy-allow-shared-egress').checked = ['1','true','yes','on'].includes(
+      String(config.REG_FACTORY_ALLOW_SHARED_EGRESS || '').toLowerCase()
+    );
     $('#proxy-mode-outlook').value = config.OUTLOOK_PROXY_MODE || 'inherit';
     $('#proxy-mode-claude').value = config.CLAUDE_PROXY_MODE || 'inherit';
     $('#proxy-mode-chatgpt').value = config.CHATGPT_PROXY_MODE || 'inherit';
@@ -319,15 +305,16 @@ function collectProxyConfig(){
     CLASH_PROXY: $('#proxy-clash-proxy').value.trim(),
     CLASH_GROUP: $('#proxy-clash-group').value.trim(),
     CLASH_FIXED_NODE: $('#proxy-fixed-node').value,
-    REG_FACTORY_PLUS_LINK_ROUTE: $('#proxy-plus-link-route').value,
-    REG_FACTORY_PLUS_BIND_ROUTE: $('#proxy-plus-bind-route').value,
-    REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE: $('#proxy-plus-link-proxy').value.trim(),
-    REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE: $('#proxy-plus-bind-proxy').value.trim(),
     REG_FACTORY_PROXY: $('#proxy-residential-url').value.trim(),
     REG_FACTORY_PROXY_POOL: $('#proxy-residential-pool').value.trim(),
+    REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE: $('#proxy-plus-link-override').value.trim(),
+    REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE: $('#proxy-plus-bind-override').value.trim(),
     REG_FACTORY_PROXY_ROTATE_URL: $('#proxy-rotate-url').value.trim(),
     REG_FACTORY_PROXY_ROTATE_METHOD: $('#proxy-rotate-method').value,
     CHATGPT_RESIDENTIAL_ROTATE_RETRIES: $('#proxy-chatgpt-retries').value,
+    REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE: $('#proxy-traffic-mode').value,
+    REG_FACTORY_MAX_CONCURRENCY: $('#proxy-max-concurrency').value,
+    REG_FACTORY_ALLOW_SHARED_EGRESS: $('#proxy-allow-shared-egress').checked ? 'true' : 'false',
   };
 }
 
@@ -406,8 +393,8 @@ $('#btn-refresh-nodes').onclick = ()=>loadProxyPanel(true);
 
 // ---------------------------------------------------------------- 本地资产 API
 const ASSET_FORMATS = {
-  emails: ['json', 'line'],
-  chatgpt: ['cookies', 'raw', 'header', 'session', 'sub2api', 'cpa', 'chatgpt2api'],
+  emails: ['four', 'json', 'line'],
+  chatgpt: ['cookies', 'raw', 'header', 'session', 'email_four', 'sub2api', 'cpa', 'chatgpt2api'],
   claude: ['cookies', 'raw', 'header'],
   grok: ['cookies', 'raw', 'header', 'session', 'sub2api'],
   kiro: ['session'],
@@ -420,7 +407,7 @@ const ASSET_SCAN_PLATFORM_LABELS = {
   outlook:'Outlook', chatgpt:'ChatGPT', claude:'Claude', grok:'Grok', kiro:'Kiro',
 };
 const ASSET_PLUS_TRIAL_LABELS = {
-  eligible:'可试用', ineligible:'暂无试用', active:'已有套餐', unknown:'资格未知', disabled:'检测关闭',
+  eligible:'待确认', zero_price:'0 元试用', discount:'有折扣（非0元）', ineligible:'暂无优惠', active:'已有套餐', unknown:'资格未知', disabled:'检测关闭',
 };
 const ASSET_SCAN_PAGE_SIZE = 25;
 
@@ -451,6 +438,11 @@ function updateAssetFormats(){
     option.selected = format === previous;
     select.appendChild(option);
   });
+  $('#asset-normal-only').disabled = resource !== 'emails';
+  $('.asset-normal-only').classList.toggle('disabled', resource !== 'emails');
+  const provider = $('#asset-email-provider');
+  provider.disabled = !['emails', 'chatgpt'].includes(resource);
+  if(provider.disabled) provider.value = '';
   updateAssetRequestPreview();
 }
 
@@ -459,6 +451,13 @@ function buildAssetRequest(){
   const format = $('#asset-format').value || ASSET_FORMATS[resource][0];
   const path = resource === 'emails' ? '/api/assets/emails' : `/api/assets/cookies/${resource}`;
   const params = new URLSearchParams({format});
+  if(resource === 'emails' && $('#asset-normal-only').checked){
+    params.set('normal_only', 'true');
+  }
+  const status = $('#asset-status-filter')?.value || '';
+  if(status) params.set('status', status);
+  const emailProvider = $('#asset-email-provider').value;
+  if(emailProvider) params.set('email_provider', emailProvider);
   if(assetPickMode === 'index'){
     const index = Math.max(0, parseInt($('#asset-index').value || '0', 10));
     params.set('index', String(index));
@@ -537,6 +536,15 @@ function renderAssetScanTable(){
     appendAssetScanCell(row, ASSET_SCAN_PLATFORM_LABELS[item.platform] || item.platform, 'asset-scan-platform');
     const account = appendAssetScanCell(row, item.email || item.source, 'asset-scan-account');
     account.title = item.source || '';
+    const networkLabel = item.platform === 'chatgpt'
+      ? [item.registration_country, item.network_node].filter(Boolean).join(' · ')
+      : '';
+    const network = appendAssetScanCell(
+      row,
+      networkLabel || '--',
+      'asset-scan-network',
+    );
+    network.title = networkLabel;
     const statusCell = document.createElement('td');
     const badge = document.createElement('span');
     badge.className = `asset-status-badge ${item.status || 'unknown'}`;
@@ -582,6 +590,8 @@ function renderAssetScan(data){
   $('#btn-scan-all').disabled = !!scan.running;
   $('#btn-scan-current').disabled = !!scan.running;
   $('#asset-scan-concurrency').disabled = !!scan.running;
+  $('#asset-scan-account-concurrency').disabled = !!scan.running;
+  $('#asset-scan-plus-trial').disabled = !!scan.running;
   if(scan.running){
     const current = progress.current ? ` · ${progress.current}` : '';
     $('#asset-scan-progress-text').textContent = `扫描中 ${completed}/${total}${current}`;
@@ -589,7 +599,9 @@ function renderAssetScan(data){
   }else if(scan.error){
     $('#asset-scan-progress-text').textContent = `扫描失败：${scan.error}`;
   }else if(data.last_scan_at){
-    $('#asset-scan-progress-text').textContent = `扫描完成 ${statuses.normal || 0}/${data.summary?.total || 0} 正常`;
+    const moved = scan.quarantine?.moved_accounts || 0;
+    const quarantine = moved ? `，已隔离 ${moved} 个坏号` : '';
+    $('#asset-scan-progress-text').textContent = `扫描完成 ${statuses.normal || 0}/${data.summary?.total || 0} 正常${quarantine}`;
   }else{
     $('#asset-scan-progress-text').textContent = '尚未扫描';
   }
@@ -598,13 +610,23 @@ function renderAssetScan(data){
   renderAssetScanTable();
 }
 
-async function loadAssetScan(){
+async function loadAssetScan(progressOnly=false){
   if(assetScanTimer){ clearTimeout(assetScanTimer); assetScanTimer = null; }
   try{
-    const response = await fetch('/api/assets/scan', {headers:assetHeaders()});
+    const suffix = progressOnly ? '?progress_only=true' : '';
+    const response = await fetch(`/api/assets/scan${suffix}`, {headers:assetHeaders()});
     const data = await readAssetResponse(response);
+    if(progressOnly && !data.scan?.running){
+      await loadAssetScan(false);
+      return;
+    }
+    if(progressOnly && assetScanData){
+      data.items = assetScanData.items;
+      data.summary = assetScanData.summary;
+      data.last_scan_at = assetScanData.last_scan_at;
+    }
     renderAssetScan(data);
-    if(data.scan?.running) assetScanTimer = setTimeout(loadAssetScan, 1000);
+    if(data.scan?.running) assetScanTimer = setTimeout(()=>loadAssetScan(true), 1000);
   }catch(error){
     setAssetMessage('#asset-scan-msg', error.message || String(error), false);
   }
@@ -617,8 +639,12 @@ async function startAssetScan(all=false){
   try{
     const response = await fetch('/api/assets/scan', {method:'POST', headers:assetHeaders(true), body:JSON.stringify({
       platforms,
-      concurrency:parseInt($('#asset-scan-concurrency').value || '4', 10),
+      concurrency:parseInt($('#asset-scan-concurrency').value || '1', 10),
+      account_concurrency:parseInt($('#asset-scan-account-concurrency').value || '4', 10),
       timeout:15,
+      force:true,
+      quarantine_bad:true,
+      include_plus_trial:$('#asset-scan-plus-trial').checked,
     })});
     await readAssetResponse(response);
     setAssetMessage('#asset-scan-msg', `已开始扫描 ${all || platform === 'all' ? '全部号池' : ASSET_SCAN_PLATFORM_LABELS[platforms[0]]}`, true);
@@ -670,19 +696,66 @@ async function saveAssetKey(){
 async function callAssetApi(){
   const button = $('#btn-call-asset');
   button.disabled = true;
-  setAssetMessage('#asset-call-msg', '正在在线校验并读取资产…');
+  setAssetMessage('#asset-call-msg', '正在领取未取用资产…');
   try{
     const request = buildAssetRequest();
     const response = await fetch(request.relative, {headers:assetHeaders()});
     const data = await readAssetResponse(response);
     $('#asset-response').textContent = JSON.stringify(data, null, 2);
-    const progress = data.remaining === undefined ? '' : `，剩余 ${data.remaining} 个未领取正常账号`;
-    setAssetMessage('#asset-call-msg', `在线校验通过并完成一次性领取${progress}`, true);
+    const progress = data.remaining === undefined ? '' : `，剩余 ${data.remaining} 个未领取账号`;
+    setAssetMessage('#asset-call-msg', `已完成一次性领取${progress}`, true);
     await refreshAssetSummary(true);
   }catch(error){
     $('#asset-response').textContent = JSON.stringify({error:error.message || String(error)}, null, 2);
     setAssetMessage('#asset-call-msg', error.message || String(error), false);
   }finally{ button.disabled = false; }
+}
+
+async function exportAssetBatch(){
+  const button = $('#btn-export-assets');
+  button.disabled = true;
+  const request = buildAssetRequest();
+  const limit = Math.min(500, Math.max(1, parseInt($('#asset-batch-limit').value || '100', 10)));
+  setAssetMessage('#asset-call-msg', '正在筛选正常账号并生成批量导出文件…');
+  try{
+    const response = await fetch('/api/assets/export', {
+      method:'POST',
+      headers:assetHeaders(true),
+      body:JSON.stringify({
+        resource:request.resource,
+        format:request.format,
+        limit,
+        normal_only:!($('#asset-status-filter')?.value),
+        status:$('#asset-status-filter')?.value || '',
+        email_provider:$('#asset-email-provider').value,
+        consume:true,
+        include_claimed:true,
+      }),
+    });
+    if(!response.ok){
+      const data = await readAssetResponse(response);
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const name = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `asset-export-${request.resource}.zip`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    const count = response.headers.get('X-Asset-Count') || '0';
+    const consumed = response.headers.get('X-Asset-Consumed') || '0';
+    setAssetMessage('#asset-call-msg', `已导出 ${count} 个正常账号，${consumed} 个已移出号池`, true);
+    await Promise.all([refreshAssetSummary(true), loadAssetScan()]);
+  }catch(error){
+    setAssetMessage('#asset-call-msg', error.message || String(error), false);
+  }finally{
+    button.disabled = false;
+  }
 }
 
 async function resetAssetCursor(){
@@ -704,11 +777,15 @@ async function resetAssetCursor(){
 $('#asset-resource').onchange = updateAssetFormats;
 $('#asset-format').onchange = updateAssetRequestPreview;
 $('#asset-index').oninput = updateAssetRequestPreview;
+$('#asset-normal-only').onchange = updateAssetRequestPreview;
+$('#asset-email-provider').onchange = updateAssetRequestPreview;
+$('#asset-status-filter').onchange = updateAssetRequestPreview;
 $('#asset-api-key').oninput = updateAssetRequestPreview;
 $$('[data-asset-pick]').forEach(button=>button.onclick=()=>setAssetPickMode(button.dataset.assetPick));
 $('#btn-refresh-assets').onclick = ()=>Promise.all([refreshAssetSummary(), loadAssetScan()]);
 $('#btn-save-asset-key').onclick = saveAssetKey;
 $('#btn-call-asset').onclick = callAssetApi;
+$('#btn-export-assets').onclick = exportAssetBatch;
 $('#btn-reset-asset').onclick = resetAssetCursor;
 $('#btn-copy-url').onclick = ()=>copyText($('#asset-request-url').textContent, $('#btn-copy-url'));
 $('#btn-copy-curl').onclick = ()=>copyText($('#asset-curl-example').textContent, $('#btn-copy-curl'));
@@ -777,7 +854,8 @@ async function openK12Channel(){
 $('#btn-k12-start').onclick = startK12Service;
 $('#btn-k12-retry').onclick = openK12Channel;
 
-// ---------------------------------------------------------------- ChatGPT Plus 本地工作台
+// ---------------------------------------------------------------- Existing Plus accounts -> Codex OAuth -> SUB2API
+
 function setPlusImportState(text, kind=''){
   const state = $('#plus-import-state');
   if(!state) return;
@@ -786,139 +864,401 @@ function setPlusImportState(text, kind=''){
 }
 
 function renderPlusStatus(status){
-  const alive = !!status.alive;
+  const alive = !!status.ready;
   $('#dot-plus').classList.remove('pending');
   $('#dot-plus').classList.toggle('on', alive);
-  $('#plus-nav-state').textContent = alive ? '在线' : '离线';
+  $('#plus-nav-state').textContent = status.active ? '运行中' : (alive ? '就绪' : '未配置');
   $('#plus-nav-state').classList.toggle('on', alive);
-  if(status.url){
-    plusUrl = status.url;
-    $('#plus-open').href = plusUrl;
-  }
+  const providers = (status.providers || []).join(' / ');
+  setPlusImportState(status.message + (providers ? ` · 接码 ${providers}` : ''), alive ? 'ok' : 'bad');
 }
 
-async function fetchPlusStatus(){
+async function loadPlusImportStatus(){
   try{
     const status = await (await fetch('/api/chatgpt-plus/status')).json();
     renderPlusStatus(status);
     return status;
   }catch(e){
-    renderPlusStatus({alive:false});
-    return {alive:false};
+    renderPlusStatus({ready:false, message:'状态读取失败'});
+    return {ready:false};
   }
 }
 
-async function openPlusChannel(){
-  let status = await fetchPlusStatus();
-  if(!status.alive && status.ready){
-    status = await (await fetch('/api/chatgpt-plus/start', {method:'POST'})).json();
-    renderPlusStatus(status);
-  }
-  if(!status.alive) throw new Error(status.message || '本地 Plus 工作台当前不可用');
-  if($('#plus-frame').getAttribute('src') === 'about:blank') $('#plus-frame').src = plusUrl;
-  await waitForPlusFrame();
-  setPlusImportState('本地工作台已就绪', 'ok');
-  return status;
+function appendPlusLog(line){
+  const log = $('#plus-run-log');
+  log.textContent += (log.textContent ? '\n' : '') + line;
+  log.scrollTop = log.scrollHeight;
 }
 
-async function waitForPlus(test, timeoutMs, timeoutMessage){
-  const deadline = Date.now() + timeoutMs;
-  while(Date.now() < deadline){
-    const result = test();
-    if(result) return result;
-    await new Promise(resolve=>setTimeout(resolve, 100));
-  }
-  throw new Error(timeoutMessage);
+function setPlusRunControls(running){
+  $('#btn-plus-import').disabled = running;
+  $('#btn-plus-protocol-run').disabled = running;
+  $('#btn-plus-stop').disabled = !running;
+  $('#plus-account-input').disabled = running;
+  $$('#view-plus .plus-import-form input, #view-plus .plus-import-form select').forEach(element=>{
+    if(element.id !== 'plus-keep-on-fail') element.disabled = running;
+  });
+  $('#custom-sms-input').disabled = running;
+  $('#btn-custom-sms-import').disabled = running;
+  $('#btn-plus-payment-config').disabled = running;
 }
 
-async function waitForPlusFrame(){
-  const frame = $('#plus-frame');
-  return waitForPlus(()=>{
-    try{
-      const doc = frame.contentDocument;
-      return doc && doc.getElementById('accountImportInput') ? {frame, doc, win:frame.contentWindow} : null;
-    }catch(e){ return null; }
-  }, 20000, '本地 Plus 工作台加载超时');
+function renderCustomSmsSummary(pool, summaryId='custom-sms-summary'){
+  const summary = $(`#${summaryId}`);
+  if(summary) summary.textContent = `可用 ${pool.available || 0} / 占用 ${pool.leased || 0} / 已用 ${pool.used || 0}`;
 }
 
-async function importLocalPlusAts(){
-  if(plusImporting) return;
-  const button = $('#btn-import-ats');
-  plusImporting = true;
-  button.disabled = true;
-  setPlusImportState('正在读取本地 free AT...');
+async function loadCustomSmsPool(summaryId='custom-sms-summary'){
   try{
-    await openPlusChannel();
-    const response = await fetch(`/api/chatgpt-plus/export-ats?limit=${PLUS_IMPORT_LIMIT}`, {cache:'no-store'});
-    const data = await response.json();
-    if(!response.ok) throw new Error(data.error || `AT 读取失败 (${response.status})`);
-    if(!data.count) throw new Error('没有可导入的未过期 free AT');
-    const context = await waitForPlusFrame();
-    const importInput = context.doc.getElementById('accountImportInput');
-    const importButton = context.doc.getElementById('importAtButton');
-    if(!importInput || !importButton) throw new Error('本地工作台批量导入控件不可用');
-    const before = context.doc.querySelectorAll('.account-row').length;
-    importInput.value = data.ats.join('\n');
-    importInput.dispatchEvent(new context.win.Event('input', {bubbles:true}));
-    importButton.click();
-    await waitForPlus(()=> importInput.value === '' ? true : null, 30000, 'AT 批量导入未完成');
-    const total = context.doc.querySelectorAll('.account-row').length;
-    const imported = Math.max(0, total - before);
-    const selectAll = context.doc.getElementById('selectAllAccounts');
-    if(selectAll && !selectAll.checked){
-      selectAll.checked = true;
-      selectAll.dispatchEvent(new context.win.Event('change', {bubbles:true}));
-    }
-    const concurrency = context.doc.getElementById('batchConcurrency');
-    if(concurrency){
-      const current = Number(concurrency.value) || PLUS_BATCH_SIZE;
-      concurrency.value = String(Math.min(PLUS_BATCH_SIZE, Math.max(1, current)));
-      concurrency.dispatchEvent(new context.win.Event('input', {bubbles:true}));
-    }
-    setPlusImportState(
-      imported ? `已批量导入 ${imported} 条 AT，当前共 ${total} 个账号` : `这 ${data.count} 条 AT 已在工作台中`,
-      'ok'
-    );
+    const response = await fetch('/api/sms/custom');
+    const pool = await readJsonResponse(response);
+    if(!response.ok) throw new Error(pool.error || `HTTP ${response.status}`);
+    renderCustomSmsSummary(pool, summaryId);
+    return pool;
   }catch(error){
-    setPlusImportState(error.message || String(error), 'bad');
-  }finally{
-    plusImporting = false;
-    button.disabled = false;
+    const summary = $(`#${summaryId}`);
+    if(summary) summary.textContent = '读取失败';
+    return null;
   }
 }
 
-async function copyLocalPlusAts(){
-  const btn = $('#btn-copy-ats');
-  btn.disabled = true;
-  btn.textContent = '加载中...';
+async function importCustomSmsPoolInto(inputId, summaryId, messageId, buttonId, preservePlusState=false){
+  const input = $(`#${inputId}`);
+  const text = input.value.trim();
+  const message = $(`#${messageId}`);
+  message.className = '';
+  if(!text){
+    message.textContent = '请先粘贴号码与记录 URL';
+    message.className = 'bad';
+    return;
+  }
+  const button = $(`#${buttonId}`);
+  button.disabled = true;
   try{
-    const data = await (await fetch(`/api/chatgpt-plus/export-ats?limit=${PLUS_IMPORT_LIMIT}`, {cache:'no-store'})).json();
-    if(!data.ats || !data.ats.length){
-      btn.textContent = '无可用 AT';
-      setTimeout(()=>{ btn.textContent = '复制本批 AT'; btn.disabled = false; }, 2000);
+    const response = await fetch('/api/sms/custom', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text}),
+    });
+    const result = await readJsonResponse(response);
+    if(!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    renderCustomSmsSummary(result, summaryId);
+    message.textContent = `新增 ${result.added}，更新 ${result.updated}，跳过 ${result.skipped}，格式错误 ${result.bad}`;
+    message.className = result.bad ? 'bad' : '';
+    if(result.added || result.updated) input.value = '';
+  }catch(error){
+    message.textContent = error.message || String(error);
+    message.className = 'bad';
+  }finally{
+    button.disabled = preservePlusState ? !!plusRun : false;
+  }
+}
+
+async function importCustomSmsPool(){
+  return importCustomSmsPoolInto(
+    'custom-sms-input', 'custom-sms-summary',
+    'custom-sms-message', 'btn-custom-sms-import', true
+  );
+}
+
+$('#btn-custom-sms-import').onclick = importCustomSmsPool;
+$('#custom-sms-import').addEventListener('toggle', event=>{
+  if(event.currentTarget.open) loadCustomSmsPool();
+});
+
+function setPlusProtocolState(text, kind=''){
+  const node = $('#plus-protocol-state');
+  if(!node) return;
+  node.textContent = text;
+  node.className = kind;
+}
+
+async function loadPlusProtocolStatus(){
+  try{
+    const response = await fetch('/api/chatgpt-plus/protocol-status', {cache:'no-store'});
+    const data = await readJsonResponse(response);
+    if(!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const select = $('#plus-protocol-method');
+    (data.methods || []).forEach(method=>{
+      const option = select.querySelector(`option[value="${method.id}"]`);
+      if(!option) return;
+      option.disabled = !method.available || !method.batch_enabled;
+      option.title = method.reason || '';
+    });
+    if(select.selectedOptions[0] && select.selectedOptions[0].disabled){
+      const fallback = [...select.options].find(option=>!option.disabled);
+      if(fallback) select.value = fallback.value;
+    }
+    const poolOption = $('#plus-protocol-source').querySelector('option[value="pool"]');
+    if(poolOption) poolOption.textContent = `号池有资格账号（${data.pool_eligible_count || 0}）`;
+    plusProtocolStatus = data;
+    const payOption = $('#plus-protocol-action').querySelector('option[value="pay"]');
+    if(payOption){
+      payOption.disabled = !data.payment_ready;
+      payOption.title = data.payment_ready ? '' : data.payment_message || 'PayPal 支付资料未配置';
+    }
+    setPlusProtocolState(
+      `${data.message} · 已授权 ${data.account_count || 0} · 号池有资格 ${data.pool_eligible_count || 0}`,
+      data.engine_ready ? 'ok' : 'bad',
+    );
+    syncPlusProtocolAction();
+    return data;
+  }catch(error){
+    setPlusProtocolState(error.message || '协议状态读取失败', 'bad');
+    return null;
+  }
+}
+
+function protocolRequestPayload(emails=[]){
+  const operation = $('#plus-protocol-action').value || 'extract';
+  const payload = {
+    method: $('#plus-protocol-method').value,
+    workers: Number($('#plus-protocol-concurrency').value),
+    source: $('#plus-protocol-source').value,
+    operation,
+    confirm_payment: operation === 'pay' && $('#plus-payment-confirm').checked,
+    emails,
+  };
+  if(operation === 'pay' && hasInlinePaymentDetails()){
+    payload.payment_details = {
+      cards: $('#plus-payment-cards').value,
+      addresses: $('#plus-payment-addresses').value,
+      phones: $('#plus-payment-phones').value,
+    };
+  }
+  return payload;
+}
+
+function hasInlinePaymentDetails(){
+  return [$('#plus-payment-cards'), $('#plus-payment-addresses'), $('#plus-payment-phones')]
+    .some(element=>element.value.trim());
+}
+
+function hasCompleteInlinePaymentDetails(){
+  return [$('#plus-payment-cards'), $('#plus-payment-addresses'), $('#plus-payment-phones')]
+    .every(element=>element.value.trim());
+}
+
+function syncPaymentDetailsState(){
+  const state = $('#plus-payment-details-state');
+  if(hasCompleteInlinePaymentDetails()){
+    state.textContent = '本次资料已录入';
+    state.className = 'ok';
+  }else if(plusProtocolStatus?.payment_configured){
+    state.textContent = '使用引擎默认资料';
+    state.className = '';
+  }else{
+    state.textContent = '需要录入本次资料';
+    state.className = 'bad';
+  }
+}
+
+function clearInlinePaymentDetails(){
+  $('#plus-payment-cards').value = '';
+  $('#plus-payment-addresses').value = '';
+  $('#plus-payment-phones').value = '';
+  $('#plus-payment-dialog-message').textContent = '';
+  syncPaymentDetailsState();
+}
+
+function syncPlusProtocolAction(){
+  const operation = $('#plus-protocol-action').value;
+  const paying = operation === 'pay';
+  const confirmRow = $('#plus-payment-confirm-row');
+  confirmRow.hidden = !paying;
+  if(paying){
+    $('#plus-protocol-method').value = 'paypal';
+    $('#plus-protocol-concurrency').value = '1';
+    $('#plus-protocol-note').textContent = 'PayPal 支付资料可在本次任务临时录入；每个账号支付前仍会实时复检 Plus 优惠。';
+    syncPaymentDetailsState();
+  }else{
+    $('#plus-payment-confirm').checked = false;
+    $('#plus-protocol-note').textContent = '号池来源只载入缓存为有资格的账号；所有账号执行前都会再次实时复检。';
+  }
+  $('#plus-protocol-concurrency').disabled = paying || !!plusRun;
+}
+
+async function startPlusProtocolBatch(emails=[]){
+  if(plusRun) return;
+  const operation = $('#plus-protocol-action').value || 'extract';
+  const method = $('#plus-protocol-method').selectedOptions[0];
+  if(!method || method.disabled){
+    setPlusProtocolState(method?.title || '请选择可执行的提链渠道', 'bad');
+    return;
+  }
+  if(operation === 'pay'){
+    if(!hasCompleteInlinePaymentDetails() && !plusProtocolStatus?.payment_configured){
+      setPlusProtocolState('请先录入本次 PayPal 支付资料', 'bad');
+      $('#plus-payment-dialog').showModal();
       return;
     }
-    await navigator.clipboard.writeText(data.ats.join('\n'));
-    btn.textContent = '已复制 ' + data.count + ' 条';
-    setTimeout(()=>{ btn.textContent = '复制本批 AT'; btn.disabled = false; }, 2000);
-  }catch(e){
-    btn.textContent = '复制失败';
-    setTimeout(()=>{ btn.textContent = '复制本批 AT'; btn.disabled = false; }, 2000);
+    if(!$('#plus-payment-confirm').checked){
+      setPlusProtocolState('执行真实支付前必须勾选支付确认', 'bad');
+      return;
+    }
+    if(!window.confirm('将对选中的 Plus 优惠账号执行真实 PayPal 支付。确认继续？')) return;
   }
-}
-
-async function loadPlusAtCount(){
+  const label = method.textContent.split(' · ')[0];
+  const operationLabel = operation === 'pay' ? '批量支付' : '批量提链';
+  setPlusProtocolState(`正在检查 Plus 优惠并创建 ${label} ${operationLabel}任务`);
+  setPlusRunControls(true);
   try{
-    const data = await (await fetch(`/api/chatgpt-plus/export-ats?limit=${PLUS_IMPORT_LIMIT}`, {cache:'no-store'})).json();
-    $('#plus-at-count').textContent = `${data.available || 0} 个可用 · 可导入 ${data.count || 0}`;
-    $('#btn-import-ats').disabled = Number(data.count || 0) === 0;
-  }catch(e){
-    $('#plus-at-count').textContent = '无法读取';
+    const response = await fetch('/api/chatgpt-plus/protocol-batch', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(protocolRequestPayload(emails)),
+    });
+    const data = await readJsonResponse(response);
+    if(!response.ok) throw new Error(data.error || `协议任务创建失败 (${response.status})`);
+    const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
+    if(skipped) appendPlusLog(`[protocol] 资格不符或状态未知，跳过 ${skipped} 个账号`);
+    if(operation === 'pay') clearInlinePaymentDetails();
+    setPlusProtocolState(`已创建 ${data.accepted} 个账号的 ${label} ${operationLabel}任务`, 'ok');
+    monitorPlusRun(data.run_id, data.accepted, operation === 'pay' ? 'payment' : 'protocol');
+  }catch(error){
+    setPlusProtocolState(error.message || String(error), 'bad');
+    setPlusRunControls(false);
   }
 }
 
-$('#btn-copy-ats').onclick = copyLocalPlusAts;
-$('#btn-import-ats').onclick = importLocalPlusAts;
+function monitorPlusRun(runId, accepted, kind='import'){
+  if(plusEventSource) plusEventSource.close();
+  plusRun = runId;
+  $('#plus-run-summary').textContent = kind === 'payment' ? `${accepted} 个账号支付中` : kind === 'protocol' ? `${accepted} 个账号提链中` : `${accepted} 个账号运行中`;
+  setPlusRunControls(true);
+  plusEventSource = new EventSource(`/api/logs/${runId}`);
+  plusEventSource.onmessage = event=>{
+    appendPlusLog(event.data);
+    if(kind !== 'import'){
+      if(event.data.includes('[protocol][OK]')) $('#plus-run-summary').textContent = kind === 'payment' ? '协议支付持续完成' : '协议提链持续产出结果';
+      else if(event.data.includes('[protocol][FAIL]')) $('#plus-run-summary').textContent = kind === 'payment' ? '协议支付存在失败账号' : '协议提链存在失败账号';
+    }else if(event.data.includes('[add-phone] 手机验证通过')){
+      $('#plus-run-summary').textContent = '手机号验证通过，继续 OAuth';
+    }else if(event.data.includes('[OK]')){
+      $('#plus-run-summary').textContent = '已有账号导入成功';
+    }else if(event.data.includes('[FAIL]')){
+      $('#plus-run-summary').textContent = '存在失败账号';
+    }
+  };
+  plusEventSource.addEventListener('done', event=>{
+    let result = {};
+    try{ result = JSON.parse(event.data || '{}'); }catch(e){}
+    const succeeded = result.returncode === 0;
+    appendPlusLog(succeeded ? (kind === 'payment' ? '[webui] 批量协议支付完成' : kind === 'protocol' ? '[webui] 批量协议提链完成' : '[webui] 批量导入完成') : '[webui] 任务结束，请检查失败阶段');
+    $('#plus-run-summary').textContent = succeeded ? '全部完成' : '执行结束';
+    if(kind === 'payment') setPlusProtocolState(succeeded ? '批量协议支付完成' : '批量协议支付存在失败', succeeded ? 'ok' : 'bad');
+    else if(kind === 'protocol') setPlusProtocolState(succeeded ? '批量协议提链完成' : '批量协议提链存在失败', succeeded ? 'ok' : 'bad');
+    else setPlusImportState(succeeded ? '批量导入完成' : '部分账号未导入', succeeded ? 'ok' : 'bad');
+    plusEventSource.close();
+    plusEventSource = null;
+    plusRun = null;
+    setPlusRunControls(false);
+    loadPlusImportStatus();
+    loadCustomSmsPool();
+    loadPlusProtocolStatus();
+    if(kind === 'import' && succeeded && plusAfterImport){
+      const pending = plusAfterImport;
+      plusAfterImport = null;
+      startPlusProtocolBatch(pending.emails);
+    }else if(kind !== 'import'){
+      plusAfterImport = null;
+    }
+  });
+  plusEventSource.onerror = ()=>{
+    if(plusRun){
+      if(kind !== 'import') setPlusProtocolState('日志连接中断，正在等待任务状态', 'bad');
+      else setPlusImportState('日志连接中断，正在等待任务状态', 'bad');
+    }
+  };
+}
+
+async function startPlusCodexImport(){
+  if(plusRun) return;
+  const accounts = $('#plus-account-input').value.trim();
+  if(!accounts){ setPlusImportState('请粘贴至少一个 Plus 账号', 'bad'); return; }
+  const runProtocol = !!$('#plus-protocol-action').value;
+  if(runProtocol && $('#plus-protocol-method').selectedOptions[0]?.disabled){
+    setPlusProtocolState($('#plus-protocol-method').selectedOptions[0]?.title || '请选择可执行的提链渠道', 'bad');
+    return;
+  }
+  if($('#plus-protocol-action').value === 'pay' && !hasCompleteInlinePaymentDetails() && !plusProtocolStatus?.payment_configured){
+    setPlusProtocolState('请先录入本次 PayPal 支付资料', 'bad');
+    $('#plus-payment-dialog').showModal();
+    return;
+  }
+  if($('#plus-protocol-action').value === 'pay' && !$('#plus-payment-confirm').checked){
+    setPlusProtocolState('授权后执行真实支付前必须勾选支付确认', 'bad');
+    return;
+  }
+  plusAfterImport = null;
+  setPlusImportState('正在创建登录与手机号接码任务');
+  $('#plus-run-log').textContent = '';
+  setPlusRunControls(true);
+  try{
+    const response = await fetch('/api/chatgpt-plus/import-codex', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        accounts,
+        sms_provider:$('#plus-sms-provider').value,
+        phone_attempts:Number($('#plus-phone-attempts').value),
+        sms_timeout:Number($('#plus-sms-timeout').value),
+        concurrency:Number($('#plus-concurrency').value),
+        group:$('#plus-group').value.trim() || 'codex',
+        node:$('#plus-node').value.trim() || 'auto',
+        keep_on_fail:$('#plus-keep-on-fail').checked,
+        skip_phone:$('#plus-skip-phone').checked,
+        no_import:$('#plus-no-import').checked,
+        output_format:$('#plus-output-format').value,
+      }),
+    });
+    const data = await readJsonResponse(response);
+    if(!response.ok) throw new Error(data.error || `任务创建失败 (${response.status})`);
+    $('#plus-account-input').value = '';
+    if(runProtocol) plusAfterImport = {emails: data.accepted_emails || []};
+    setPlusImportState(`已接收 ${data.accepted} 个账号，开始登录和手机号接码`, 'ok');
+    monitorPlusRun(data.run_id, data.accepted, 'import');
+  }catch(error){
+    setPlusImportState(error.message || String(error), 'bad');
+    setPlusRunControls(false);
+  }
+}
+
+async function stopPlusCodexImport(){
+  if(!plusRun) return;
+  $('#btn-plus-stop').disabled = true;
+  try{
+    await fetch(`/api/stop/${plusRun}`, {method:'POST'});
+    setPlusImportState('正在停止批量任务');
+  }finally{
+    $('#btn-plus-stop').disabled = false;
+  }
+}
+
+$('#btn-plus-import').onclick = startPlusCodexImport;
+$('#btn-plus-stop').onclick = stopPlusCodexImport;
+$('#btn-plus-protocol-run').onclick = ()=>startPlusProtocolBatch();
+$('#plus-protocol-action').onchange = syncPlusProtocolAction;
+$('#plus-protocol-source').onchange = ()=>loadPlusProtocolStatus();
+$('#btn-plus-payment-config').onclick = ()=>{
+  $('#plus-payment-dialog-message').textContent = '';
+  $('#plus-payment-dialog').showModal();
+};
+$('#btn-plus-payment-close').onclick = ()=>$('#plus-payment-dialog').close();
+$('#btn-plus-payment-apply').onclick = ()=>{
+  const message = $('#plus-payment-dialog-message');
+  if(!hasCompleteInlinePaymentDetails()){
+    message.textContent = '卡片、账单地址和手机号接码都需要填写';
+    message.className = 'bad';
+    return;
+  }
+  message.textContent = '';
+  message.className = '';
+  syncPaymentDetailsState();
+  $('#plus-payment-dialog').close();
+};
+syncPlusProtocolAction();
+loadPlusProtocolStatus();
 
 // ---------------------------------------------------------------- 脚本导航
 function appendNavGroup(nav, title, items, renderItem, open=false){
@@ -981,13 +1321,18 @@ async function loadScripts(){
 }
 
 function selectScript(id){
-  curSrc = SCRIPTS.find(s=>s.id===id);
-  if(!curSrc) return;
+  const nextSrc = SCRIPTS.find(s=>s.id===id);
+  if(!nextSrc) return;
+  const sameScript = curSrc?.id === id;
+  if(curSrc && !sameScript) captureScriptDraft(curSrc);
+  curSrc = nextSrc;
   $$('.scriptbtn').forEach(b=>b.classList.toggle('active', b.dataset.id===id));
   const active = $(`.scriptbtn[data-id="${id}"]`);
   if(active?.closest('details')) active.closest('details').open = true;
   if(!evtSrc) setRunState('idle', '待运行');
+  if(sameScript && $('#form-panel')?.children.length) return;
   renderForm(curSrc);
+  restoreScriptDraft(curSrc);
 }
 
 // ---------------------------------------------------------------- 渲染表单
@@ -1001,8 +1346,14 @@ function renderArgField(a){
     f.innerHTML = `<input type="checkbox" id="f_${label}" ${a.default?'checked':''}>
       <label for="f_${label}"><span>${label}</span>${a.help?`<small>${a.help}</small>`:''}</label>`;
   }else if(a.type==='choice'){
+    let displayNames = null;
+    if(a.countryNames && typeof Intl.DisplayNames === 'function'){
+      displayNames = new Intl.DisplayNames(['zh-CN'], {type:'region'});
+    }
+    const choiceLabel = c => (a.labels&&a.labels[c])
+      || (displayNames && c !== 'auto' ? `${displayNames.of(c)} (${c})` : c);
     f.innerHTML = `<label for="f_${label}">${label}</label>
-      <select id="f_${label}">${a.choices.map(c=>`<option value="${c}" ${c==a.default?'selected':''}>${(a.labels&&a.labels[c])||c}</option>`).join('')}</select>
+      <select id="f_${label}">${a.choices.map(c=>`<option value="${c}" ${c==a.default?'selected':''}>${choiceLabel(c)}</option>`).join('')}</select>
       ${a.help?`<div class="fhelp">${a.help}</div>`:''}`;
   }else if(a.type==='multi'){
     const def = a.default||[];
@@ -1049,6 +1400,30 @@ function renderForm(s){
     p.appendChild(more);
   }
 
+  // Single-platform ChatGPT also needs a visible custom-number import path.
+  // The pool is shared with Plus/Codex workflows and is consumed by provider=custom.
+  if(s.id === 'register_chatgpt' && s.args.some(a=>a.flag === '--codex-sms-provider' && (a.choices || []).includes('custom'))){
+    const custom = document.createElement('details');
+    custom.className = 'custom-sms-import';
+    custom.innerHTML = `<summary>自定义手机号池 <span id="single-custom-sms-summary">正在读取</span></summary>
+      <label class="plus-field plus-field-wide">
+        <span>手机号与短信记录 URL（每行一个）</span>
+        <textarea id="single-custom-sms-input" spellcheck="false" autocomplete="off" placeholder="+13435775857----https://example.com/smsrecord?token=..."></textarea>
+      </label>
+      <div class="custom-sms-actions">
+        <button id="single-custom-sms-import" class="btn-secondary" type="button">导入号码</button>
+        <span id="single-custom-sms-message" role="status" aria-live="polite"></span>
+      </div>`;
+    custom.addEventListener('toggle', event=>{
+      if(event.currentTarget.open) loadCustomSmsPool('single-custom-sms-summary');
+    });
+    p.appendChild(custom);
+    custom.querySelector('#single-custom-sms-import').onclick = ()=>importCustomSmsPoolInto(
+      'single-custom-sms-input', 'single-custom-sms-summary',
+      'single-custom-sms-message', 'single-custom-sms-import'
+    );
+  }
+
   const actions = document.createElement('div'); actions.className='form-actions';
   const btn = document.createElement('button');
   btn.className='btn-run btn-run-task'; btn.textContent='▶ 运行任务';
@@ -1075,6 +1450,46 @@ function collectArgs(s){
   return args;
 }
 
+function captureScriptDraft(s){
+  const panel = $('#form-panel');
+  if(!s || !panel?.children.length) return;
+  const draft = {};
+  s.args.forEach(a=>{
+    const label = a.flag.replace(/^--/,'');
+    if(a.type==='bool'){
+      draft[a.flag] = !!$(`#f_${label}`)?.checked;
+    }else if(a.type==='multi'){
+      draft[a.flag] = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+    }else{
+      draft[a.flag] = $(`#f_${label}`)?.value ?? '';
+    }
+  });
+  draft.__advancedOpen = !!$('.advanced-fields', panel)?.open;
+  scriptDrafts.set(s.id, draft);
+}
+
+function restoreScriptDraft(s){
+  const draft = scriptDrafts.get(s.id);
+  if(!draft) return;
+  s.args.forEach(a=>{
+    const label = a.flag.replace(/^--/,'');
+    if(a.type==='bool'){
+      const input = $(`#f_${label}`);
+      if(input) input.checked = !!draft[a.flag];
+    }else if(a.type==='multi'){
+      const selected = new Set(draft[a.flag] || []);
+      $$(`input[data-multi="${label}"]`).forEach(input=>{
+        input.checked = selected.has(input.value);
+      });
+    }else{
+      const input = $(`#f_${label}`);
+      if(input && Object.hasOwn(draft, a.flag)) input.value = draft[a.flag];
+    }
+  });
+  const advanced = $('.advanced-fields', $('#form-panel'));
+  if(advanced) advanced.open = !!draft.__advancedOpen;
+}
+
 // ---------------------------------------------------------------- 运行 + SSE 日志
 function setRunState(state, label){
   const el = $('#run-state');
@@ -1085,7 +1500,9 @@ function setRunState(state, label){
 async function runScript(){
   if(curRun && evtSrc){ evtSrc.close(); evtSrc = null; }
   const args = collectArgs(curSrc);
-  const selectedPlatforms = args['--platforms'] || [];
+  const selectedPlatforms = Array.isArray(args['--platforms'])
+    ? args['--platforms']
+    : (args['--platforms'] ? [args['--platforms']] : []);
   const plusRequested = !!args['--plus-subscription']
     && (curSrc.id === 'register_chatgpt' || selectedPlatforms.includes('chatgpt'));
   const log = $('#log'); log.textContent='';
@@ -1192,12 +1609,21 @@ async function loadEnv(){
     const notice = g.notice
       ? `<div class="env-notice ${g.notice_level==='warning'?'warning':''}" role="alert">${g.notice}</div>`
       : '';
-    box.innerHTML = `<div class="env-group-title">
-        <span>${g.group}</span>
-        <span class="test-area">${tests}<span class="test-result" data-result-for="${g.group}"></span></span>
-      </div>${notice}`;
+    const isBrowserGroup = itemKeys.has('FINGERPRINT_BROWSER');
+    const configuredCount = (g.items||[]).filter(it=>{
+      const current = String(it.value ?? '').trim();
+      return current !== '' && current !== String(it.default ?? '').trim();
+    }).length;
+    box.innerHTML = `<div class="env-group-title" role="button" tabindex="0" aria-expanded="false">
+        <span class="env-group-name">${g.group}<small>${configuredCount?`已配置 ${configuredCount} 项`:'使用默认配置'}</small></span>
+        <span class="test-area"><button type="button" class="btn-env-all" hidden>显示全部</button>${tests}<span class="test-result" data-result-for="${g.group}"></span><button type="button" class="btn-env-toggle" aria-expanded="false">智能配置</button></span>
+      </div>${notice}<div class="env-smart-empty" hidden>当前没有需要填写的项目；可使用默认配置，或点击“显示全部”调整。</div>`;
     g.items.forEach(it=>{
       const row = document.createElement('div'); row.className='env-item';
+      row.dataset.envKey = it.key;
+      const current = String(it.value ?? '').trim();
+      const customized = current !== '' && current !== String(it.default ?? '').trim();
+      row.dataset.smart = (it.smart || it.required || customized) ? 'true' : 'false';
       const type = it.secret ? 'password':'text';
       const value = it.value || it.default || '';
       let control;
@@ -1214,13 +1640,90 @@ async function loadEnv(){
                  placeholder="${it.default? '默认 '+it.default : ''}">`;
       }
       row.innerHTML = `
-        <div class="k">${it.key}${it.required?'<span class="req">*</span>':''}</div>
+        <div class="k"><span class="env-label">${it.label||it.key}${it.required?'<span class="req">*</span>':''}</span><code class="env-key">${it.key}</code></div>
         <div class="v">
           ${control}
           ${it.help?`<div class="ehelp">${it.help}</div>`:''}
         </div>`;
       box.appendChild(row);
     });
+    const state = {open:false, all:false};
+    const toggleButton = box.querySelector('.btn-env-toggle');
+    const title = box.querySelector('.env-group-title');
+    const allButton = box.querySelector('.btn-env-all');
+    const noticeBox = box.querySelector('.env-notice');
+    const emptyBox = box.querySelector('.env-smart-empty');
+    const selectedValue = key=>String(box.querySelector(`[data-env="${key}"]`)?.value || '').toLowerCase();
+    const visibleForProvider = key=>{
+      if(isBrowserGroup){
+        const selected = selectedValue('FINGERPRINT_BROWSER') || 'bitbrowser';
+        if(key === 'FINGERPRINT_BROWSER') return true;
+        if(key === 'CUSTOM_BROWSER_PATH' || key === 'REG_FACTORY_BROWSER_PATH' || key === 'REG_FACTORY_BROWSER_HELPER')
+          return ['bundled','embedded','local','custom','chrome','chromium'].includes(selected);
+        if(key === 'CUSTOM_BROWSER_API' || key.startsWith('CUSTOM_BROWSER_API_')) return ['custom_api','api'].includes(selected);
+        if(key.startsWith('CLOAK_')) return ['cloak','cloakbrowser'].includes(selected);
+        if(key.startsWith('ROXY_')) return ['roxy','roxybrowser'].includes(selected);
+        if(key === 'BITBROWSER_API' || key.startsWith('BB_') || key.startsWith('CHATGPT_BROWSER_CORE_VERSION') || key.startsWith('OUTLOOK_BROWSER_') || key.startsWith('GROK_BROWSER_'))
+          return !['bundled','embedded','local','custom','chrome','chromium','adspower','ads_power','ads','custom_api','api','cloak','cloakbrowser','roxy','roxybrowser'].includes(selected);
+        if(key.startsWith('ADSPOWER_')) return ['adspower','ads_power','ads'].includes(selected);
+      }
+      if(itemKeys.has('TEMP_EMAIL_PROVIDER')){
+        const selected = selectedValue('TEMP_EMAIL_PROVIDER') || 'gptmail';
+        const prefixes = {yyds:'YYDS_',gptmail:'GPTMAIL_',moemail:'MOEMAIL_',cfmail:'CFMAIL_',remail:'REMAIL_'};
+        const providerPrefix = Object.values(prefixes).find(prefix=>key.startsWith(prefix));
+        if(providerPrefix) return providerPrefix === prefixes[selected];
+      }
+      if(itemKeys.has('CHATGPT_EMAIL_PROVIDER') && key.startsWith('ICLOUD_'))
+        return selectedValue('CHATGPT_EMAIL_PROVIDER') === 'icloud';
+      if(itemKeys.has('PROXY_MODE')){
+        const selected = selectedValue('PROXY_MODE') || 'clash_auto';
+        if(key.startsWith('CLASH_')) return ['clash_auto','clash_fixed'].includes(selected);
+        if(key.startsWith('REG_FACTORY_PROXY')) return selected === 'residential';
+      }
+      if(itemKeys.has('OUTLOOK_GRAPH_RECOVERY_PROVIDER') && key === 'OUTLOOK_GRAPH_RECOVERY_OUTLOOK_MAILBOX')
+        return selectedValue('OUTLOOK_GRAPH_RECOVERY_PROVIDER') === 'outlook';
+      return true;
+    };
+    const refreshGroup = ()=>{
+      let eligible = 0;
+      let shown = 0;
+      box.querySelectorAll('.env-item').forEach(row=>{
+        const providerVisible = visibleForProvider(row.dataset.envKey);
+        if(providerVisible) eligible += 1;
+        const visible = state.open && providerVisible && (state.all || row.dataset.smart === 'true');
+        row.hidden = !visible;
+        if(visible) shown += 1;
+      });
+      if(noticeBox) noticeBox.hidden = !state.open;
+      emptyBox.hidden = !state.open || shown > 0;
+      allButton.hidden = !state.open || eligible <= shown;
+      allButton.textContent = state.all ? '智能显示' : '显示全部';
+      toggleButton.textContent = state.open ? '收起' : '智能配置';
+      toggleButton.setAttribute('aria-expanded', state.open ? 'true' : 'false');
+      title.setAttribute('aria-expanded', state.open ? 'true' : 'false');
+      box.classList.toggle('env-group-open', state.open);
+    };
+    box.querySelectorAll('select[data-env]').forEach(control=>control.addEventListener('change', refreshGroup));
+    toggleButton.addEventListener('click', ()=>{
+      state.open = !state.open;
+      if(!state.open) state.all = false;
+      refreshGroup();
+    });
+    allButton.addEventListener('click', ()=>{ state.all = !state.all; refreshGroup(); });
+    const toggleFromTitle = event=>{
+      if(event.target.closest('button, input, select, a')) return;
+      state.open = !state.open;
+      if(!state.open) state.all = false;
+      refreshGroup();
+    };
+    title.addEventListener('click', toggleFromTitle);
+    title.addEventListener('keydown', event=>{
+      if((event.key === 'Enter' || event.key === ' ') && !event.target.closest('button, input, select, a')){
+        event.preventDefault();
+        toggleFromTitle(event);
+      }
+    });
+    refreshGroup();
     // 绑定该组的测试按钮
     box.querySelectorAll('.btn-test').forEach(btn=>{
       btn.onclick = ()=> runTest(btn.dataset.test, btn);
@@ -1361,7 +1864,7 @@ async function releaseNum(pkey){
 }
 
 // ---------------------------------------------------------------- 新手指南
-const GUIDE_STORAGE_KEY = 'reg-factory-guide-v2';
+const GUIDE_STORAGE_KEY = 'reg-factory-guide-v3';
 const GUIDE_STEPS = [
   {
     id:'welcome', section:'开始', title:'先认识工作台', target:'.brand', placement:'bottom',
@@ -1437,11 +1940,11 @@ const GUIDE_STEPS = [
     id:'browser', section:'浏览器', title:'选择浏览器方式', target:'[data-guide-group="browser"]', placement:'left',
     prepare:async()=>ensureGuideView('env'),
     skipLabel:'跳过浏览器配置', skipTo:'outlook-recovery',
-    body:`<p><strong>ruyipage</strong> 是默认值，使用 Firefox WebDriver BiDi 指纹内核。便携包首次启动会在后台自动安装 Firefox runtime，首次任务打开时也会自动补装；以后升级直接复用，无需重复安装。</p>
-      <p>顶栏状态显示“RuyiPage 安装中”时等待下载完成。自动安装失败可在任务库运行“安装 RuyiPage Firefox”重试，或在本组填写已有 Firefox 路径后点击连通测试。</p>
-      <p><strong>bundled</strong> 使用程序自带或系统可用的 Chromium；Claude、Grok 和 Outlook 等仍依赖 Chromium CDP 的旧流程会自动回退到它。</p>
+    body:`<p><strong>bitbrowser</strong> 是默认值，需要先启动比特浏览器，并确认本地 API 通常为 <code>http://127.0.0.1:54345</code>。它为每个账号提供独立 Profile、Cookie 和指纹。</p>
+      <p><strong>bundled</strong> 使用程序自带或系统可用的 Chromium。</p>
       <p><strong>custom</strong> 使用普通 Chrome，填写 <code>CUSTOM_BROWSER_PATH</code>。Windows 常见路径是 <code>C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe</code>。</p>
-      <p><strong>bitbrowser</strong> 需要先启动比特浏览器，并确认本地 API 通常为 <code>http://127.0.0.1:54345</code>。填写后使用本组的连通测试。</p>`,
+      <p><strong>custom_api</strong> 用于接入自己的指纹浏览器。填写 API 根地址和可选 Key；兼容 BitBrowser 时保持 <code>auto</code>，常见 REST API 选择 <code>generic</code>，再填写启动接口路径。启动响应返回 <code>ws</code>、<code>cdp</code>、<code>endpoint</code> 或 <code>debugPort</code> 即可。</p>
+      <p>填写后使用本组的连通测试确认浏览器可用。</p>`,
   },
   {
     id:'outlook-recovery', section:'Outlook', title:'提取 RT 前配置辅助邮箱', target:'[data-guide-group="outlook-recovery"]', placement:'left',
@@ -1460,22 +1963,23 @@ const GUIDE_STEPS = [
       <p>连通测试只确认本机配置和服务接口可用，不代表目标网站一定允许注册，注册前仍应测试网络出口。</p>`,
   },
   {
-    id:'asset-scan', section:'资产 API', title:'先看号池状态', target:'[data-guide="asset-scan"]', placement:'bottom',
+    id:'asset-scan', section:'资产 API', title:'按需查看号池状态', target:'[data-guide="asset-scan"]', placement:'bottom',
     prepare:async()=>{ setNavOpen(false); await showView('assets'); },
     skipLabel:'跳过资产 API', skipTo:'chatgpt-email',
-    body:`<p>资产 API 用于向本地程序或下游服务读取邮箱、Cookie 和登录凭据。先在号池状态区选择类型，再运行“扫描当前类型”或“一键扫描全部”。</p>
-      <p>扫描会将资产分为正常、待解锁、封禁、过期、受限、凭据异常和检测异常。网络错误或目标站风控会显示为受限或检测异常，不会误判为封禁。</p>
-      <p>正常 ChatGPT 账号会额外标注 Plus 免费试用资格。资格接口失败只显示“资格未知”，不会改变账号健康状态。</p>
-      <p>API 不会输出未验证、封禁、过期、受限或凭据异常资产。</p>`,
+    body:`<p>资产 API 用于向本地程序或下游服务读取邮箱、Cookie 和登录凭据。需要人工复核时，可在号池状态区运行“扫描当前类型”或“一键扫描全部”；默认领取无需先扫描。</p>
+      <p>同一平台账号始终低频串行扫描，近期结果会自动复用；遇到限流或连续风控响应时会暂停该平台，降低批量请求带来的风险。</p>
+      <p>扫描会将资产分为正常、待解锁、封禁、过期、受限、凭据异常和检测异常。它依据检测时的官方接口响应作尽力判断；网络、出口或目标站风控可能造成受限或检测异常，不能作为账号永久状态的绝对结论。</p>
+      <p>正常 ChatGPT 账号会额外标注 Plus 免费试用资格，或明确显示 0 元的优惠。资格接口失败只显示“资格未知”，不会改变账号健康状态，也不会发起支付或领取优惠。</p>
+      <p>扫描仅供人工参考；只有邮箱领取勾选“仅领取最近一次扫描为正常”时，才会读取扫描缓存进行筛选。</p>`,
   },
   {
-    id:'asset-call', section:'资产 API', title:'每次输出前都会在线校验', target:'[data-guide="asset-call"]', placement:'top',
+    id:'asset-call', section:'资产 API', title:'直接一次性领取', target:'[data-guide="asset-call"]', placement:'top',
     prepare:async()=>ensureGuideView('assets'),
     skipLabel:'跳过资产 API', skipTo:'chatgpt-email',
-    body:`<p>选择资产、输出格式和取用方式后，点击“在线校验并调用 API”。顺序取用和指定 index 都只面向未领取的健康账号。</p>
-      <p>接口会先扫描对应平台，只返回状态为“正常”的记录，并立即写入领取账本。同一平台账号即使切换输出格式也不会再次返回；只有手动重置领取记录后才可重新领取。</p>
-      <p>响应中的 <code>verification</code> 是本次检测依据，<code>remaining</code> 是该平台剩余未领取正常账号数。</p>
-      <p>这代表账号在本次检测时可用，不代表后续不会被目标服务限制。读取地址和 API key 仅应提供给受信任的本地服务。</p>`,
+    body:`<p>选择资产、输出格式和取用方式后，点击“直接领取”。接口不会先发起在线检测，顺序取用和指定 index 都只面向尚未领取的本地账号。</p>
+      <p>领取邮箱时可勾选“仅领取最近一次扫描为正常”。这个选项只读取已有扫描缓存，不会在领取请求中临时检测；没有可用的正常邮箱时会明确提示先手动扫描。</p>
+      <p>返回后会立即写入领取账本。同一平台账号即使切换输出格式也不会再次返回；只有手动重置领取记录后才可重新领取。</p>
+      <p>响应中的 <code>remaining</code> 是该平台剩余未领取账号数。领取地址和 API key 仅应提供给受信任的本地服务。</p>`,
   },
   {
     id:'chatgpt-email', section:'邮箱接码', title:'ChatGPT 邮箱接码', target:'[data-guide-group="chatgpt-email"]', placement:'left',
@@ -1777,3 +2281,4 @@ scriptsReady.then(()=>{
   if(!guideStorageCompleted()) setTimeout(()=>startGuide(0), 500);
 }).catch(()=>{});
 pollStatus();
+loadCustomSmsPool();

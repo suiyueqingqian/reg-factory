@@ -33,6 +33,30 @@ class ProxySwitchTests(unittest.TestCase):
             ]):
                 self.assertEqual(proxy_switch.concrete_nodes(), ["level4-japan01"])
 
+    def test_outlook_rotation_filters_subscription_nodes_and_prefers_region(self):
+        with patch.dict(
+            outlook_reg_loop.os.environ,
+            {"NODE_REGION_KEYWORDS": r"美国"},
+            clear=True,
+        ):
+            self.assertEqual(
+                outlook_reg_loop._filter_outlook_nodes_by_region(
+                    ["有问题重新从网站获取订阅", "🇭🇰 香港 | 01", "🇯🇵 日本 | 01", "🇺🇸 美国 | 01"]
+                ),
+                ["🇺🇸 美国 | 01"],
+            )
+        with patch.dict(
+            outlook_reg_loop.os.environ,
+            {"OUTLOOK_NODE_REGION_KEYWORDS": ""},
+            clear=True,
+        ):
+            self.assertEqual(
+                outlook_reg_loop._filter_outlook_nodes_by_region(
+                    ["🇭🇰 香港 | 01", "🇯🇵 日本 | 01"]
+                ),
+                ["🇯🇵 日本 | 01"],
+            )
+
     def test_proxy_mode_keeps_legacy_residential_configuration(self):
         with patch.dict(os.environ, {"REG_FACTORY_PROXY": "http://proxy.test:8080"}, clear=True):
             self.assertEqual(proxy_switch.proxy_mode(), "residential")
@@ -80,7 +104,8 @@ class ProxySwitchTests(unittest.TestCase):
             {"FINGERPRINT_BROWSER": "bitbrowser"},
             clear=False,
         ):
-            with patch.object(outlook_reg_loop, "_bb_call", return_value=response) as request:
+            with patch.object(outlook_reg_loop, "_bb_call", return_value=response) as request, \
+                    patch("common.browser_registry.register") as register:
                 profile_id = outlook_reg_loop.bb_create_for_outlook_reg(
                     "outlook-test",
                     "http://resident:secret@home.test:9000",
@@ -93,6 +118,12 @@ class ProxySwitchTests(unittest.TestCase):
         self.assertEqual(payload["port"], "9000")
         self.assertEqual(payload["proxyUserName"], "resident")
         self.assertEqual(payload["proxyPassword"], "secret")
+        register.assert_called_once_with(
+            "profile-1",
+            name="outlook-test",
+            provider="bitbrowser",
+            api_base=outlook_reg_loop.BB_API,
+        )
 
     def test_outlook_loop_keeps_noproxy_profile_for_clash_tun(self):
         self.assertEqual(

@@ -1,14 +1,67 @@
+import asyncio
 import unittest
 import urllib.parse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import outlook_reg_loop
+from common import browser as browser_helpers
 from tools import extract_graph_tokens
 import register_outlook_standalone
 from webui import scripts as webui_scripts
 
 
 class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
+    def test_microsoft_terminal_signin_errors_are_classified(self):
+        cases = {
+            "Password sign-in isn't available. Try another method.":
+                "password_signin_unavailable",
+            "We couldn't find a Microsoft account. Try entering your details again.":
+                "account_not_found",
+            "You've tried to sign in too many times with an incorrect account or password.":
+                "signin_rate_limited",
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(
+                    register_outlook_standalone.microsoft_auth_terminal_error(message),
+                    expected,
+                )
+
+    def test_transient_microsoft_signin_stops_allow_http_fallback(self):
+        for reason in ("password_signin_unavailable", "signin_rate_limited"):
+            with self.subTest(reason=reason):
+                self.assertTrue(
+                    register_outlook_standalone.microsoft_auth_allows_http_fallback(reason)
+                )
+                self.assertTrue(outlook_reg_loop._graph_error_allows_http_fallback(reason))
+        self.assertFalse(
+            register_outlook_standalone.microsoft_auth_allows_http_fallback(
+                "account_not_found"
+            )
+        )
+        self.assertFalse(
+            outlook_reg_loop._graph_error_allows_http_fallback("account_not_found")
+        )
+
+    def test_signup_captcha_disappearance_is_not_registration_success(self):
+        state, reason = register_outlook_standalone.outlook_registration_terminal_state(
+            "https://signup.live.com/signup?lic=1", "Loading..."
+        )
+        self.assertEqual((state, reason), ("pending", "signup_form"))
+
+    def test_post_signup_account_page_confirms_registration(self):
+        state, reason = register_outlook_standalone.outlook_registration_terminal_state(
+            "https://account.microsoft.com/profile", "Your Microsoft account"
+        )
+        self.assertEqual((state, reason), ("confirmed", "post_signup_url"))
+
+    def test_privacy_notice_requires_a_followup_redirect(self):
+        state, reason = register_outlook_standalone.outlook_registration_terminal_state(
+            "https://privacynotice.account.microsoft.com/notice?ru=signup.live.com",
+            "Privacy notice",
+        )
+        self.assertEqual((state, reason), ("pending", "privacy_notice"))
+
     def test_outlook_open_falls_back_when_preferred_core_cannot_install(self):
         browser = MagicMock()
         browser.open_browser.side_effect = [
@@ -38,6 +91,47 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
             if item.get("flag") == "--max-press"
         )
         self.assertEqual(max_press["default"], "5")
+
+    def test_outlook_uses_configurable_success_rate_breaker(self):
+        self.assertEqual(outlook_reg_loop.DEFAULT_MIN_SUCCESS_RATE, 10.0)
+        self.assertEqual(outlook_reg_loop.DEFAULT_SUCCESS_RATE_WINDOW, 20)
+        outlook_entry = next(
+            item for item in webui_scripts.SCRIPTS
+            if item.get("id") == "outlook_reg_loop"
+        )
+        count = next(
+            item for item in outlook_entry["args"]
+            if item.get("flag") == "--count"
+        )
+        self.assertEqual(count["default"], 0)
+        args = {item["flag"]: item for item in outlook_entry["args"]}
+        self.assertEqual(args["--min-success-rate"]["default"], 10)
+        self.assertEqual(args["--success-rate-window"]["default"], 20)
+
+    def test_success_rate_breaker_uses_recent_full_window(self):
+        trip, _, size = outlook_reg_loop._success_rate_breaker(
+            [False] * 19, 10, 20
+        )
+        self.assertFalse(trip)
+        self.assertEqual(size, 19)
+
+        trip, rate, size = outlook_reg_loop._success_rate_breaker(
+            [True, False] + [False] * 18, 10, 20
+        )
+        self.assertTrue(trip)
+        self.assertEqual(rate, 5.0)
+        self.assertEqual(size, 20)
+
+        trip, rate, _ = outlook_reg_loop._success_rate_breaker(
+            [True, True] + [False] * 18, 10, 20
+        )
+        self.assertFalse(trip)
+        self.assertEqual(rate, 10.0)
+
+        trip, _, _ = outlook_reg_loop._success_rate_breaker(
+            [False] * 20, 0, 20
+        )
+        self.assertFalse(trip)
 
     def test_outlook_recovery_config_is_prominent_and_supports_owned_mailbox(self):
         group = next(
@@ -158,6 +252,46 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(page.evaluate.await_count, 2)
         payload = page.evaluate.call_args.args[1]
         self.assertIn("同意して続行", payload["labels"])
+
+    async def test_czech_signup_consent_gate_is_accepted(self):
+        page = MagicMock()
+        page.url = "https://signup.live.com/privacynotice?mkt=cs-CZ"
+        page.title = AsyncMock(return_value="Ochrana osobních údajů společnosti Microsoft")
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "Osobní údaje Přijmout a pokračovat",
+                "Přijmout a pokračovat",
+            ]
+        )
+        with (
+            patch.dict(register_outlook_standalone.os.environ,
+                       {"OUTLOOK_CONFIRM_BEFORE_REGISTER": "1"}, clear=False),
+            patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()),
+        ):
+            await register_outlook_standalone._maybe_confirm_before_register(page, "[#13]")
+
+        payload = page.evaluate.call_args.args[1]
+        self.assertIn("přijmout a pokračovat", payload["labels"])
+
+    async def test_czech_device_app_consent_is_accepted(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/Consent/Update?mkt=cs-CZ"
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value="Povolit této aplikaci přístup k vašim informacím Odmítnout Povolit"
+        )
+        page.locator.return_value = body
+        page.evaluate = AsyncMock(return_value="povolit")
+        with patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, accepted = await (
+                register_outlook_standalone._accept_microsoft_app_consent(page, 14)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(accepted)
+        payload = page.evaluate.call_args.args[1]
+        self.assertIn("povolit", payload["labels"])
+        self.assertIn("odmítnout", payload["negativeLabels"])
 
     async def test_arabic_device_app_consent_is_accepted(self):
         page = MagicMock()
@@ -306,6 +440,10 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
             ({"name": "BirthDay", "ariaLabel": "Día"}, "day"),
             ({"id": "BirthYearInput", "ariaLabel": "Rok"}, "year"),
             ({"id": "countryDropdownId", "ariaLabel": "País"}, "country"),
+            ({"ariaLabel": "महीना"}, "month"),
+            ({"ariaLabel": "hari"}, "day"),
+            ({"ariaLabel": "वर्ष"}, "year"),
+            ({"ariaLabel": "negara"}, "country"),
         )
         for metadata, expected in cases:
             with self.subTest(metadata=metadata):
@@ -313,6 +451,266 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
                     register_outlook_standalone._birthdate_field_kind(metadata),
                     expected,
                 )
+
+    async def test_birthdate_month_combo_requires_committed_selection(self):
+        combo = MagicMock()
+        combo.evaluate = AsyncMock(side_effect=[
+            {"text": "Month", "value": "", "label": "Birth month", "active": ""},
+            {"text": "June", "value": "", "label": "Birth month", "active": ""},
+        ])
+        combo.click = AsyncMock()
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=True)
+
+        with patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            selected = await register_outlook_standalone._select_birthdate_combo_option(
+                page, combo, 6, kind="month"
+            )
+
+        self.assertTrue(selected)
+        combo.click.assert_awaited_once_with(force=True)
+        payload = page.evaluate.await_args.args[1]
+        self.assertEqual(payload, {"value": 6, "kind": "month"})
+
+    async def test_birthdate_day_combo_retries_when_value_did_not_change(self):
+        unchanged = {
+            "text": "Day", "value": "", "label": "Birth day", "active": ""
+        }
+        combo = MagicMock()
+        combo.evaluate = AsyncMock(side_effect=[
+            unchanged,
+            unchanged,
+            {"text": "23", "value": "23", "label": "Birth day", "active": ""},
+        ])
+        combo.click = AsyncMock()
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=True)
+        page.keyboard.press = AsyncMock()
+
+        with patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            selected = await register_outlook_standalone._select_birthdate_combo_option(
+                page, combo, 23, kind="day"
+            )
+
+        self.assertTrue(selected)
+        self.assertEqual(combo.click.await_count, 2)
+        page.keyboard.press.assert_any_await("Home")
+        page.keyboard.press.assert_any_await("Enter")
+
+    def test_outlook_domain_selection_respects_network_available_options(self):
+        with (
+            patch.dict(register_outlook_standalone.os.environ,
+                       {"OUTLOOK_EMAIL_DOMAIN": "auto"}, clear=False),
+            patch.object(register_outlook_standalone, "MICROSOFT_UI_LOCALE", "ja-JP"),
+        ):
+            self.assertEqual(
+                register_outlook_standalone._preferred_outlook_domain(
+                    ["outlook.com", "outlook.jp"]
+                ),
+                "outlook.jp",
+            )
+            self.assertEqual(
+                register_outlook_standalone._preferred_outlook_domain(
+                    ["outlook.com", "outlook.co.uk"], locale="en-GB"
+                ),
+                "outlook.co.uk",
+            )
+            self.assertEqual(
+                register_outlook_standalone._preferred_outlook_domain(
+                    ["outlook.com", "outlook.com.br"], locale="pt-BR"
+                ),
+                "outlook.com.br",
+            )
+            self.assertEqual(
+                register_outlook_standalone._preferred_outlook_domain(["outlook.com"]),
+                "outlook.com",
+            )
+
+        with patch.dict(
+            register_outlook_standalone.os.environ,
+            {"OUTLOOK_EMAIL_DOMAIN": "outlook.eu"},
+            clear=False,
+        ):
+            self.assertEqual(
+                register_outlook_standalone._preferred_outlook_domain(["outlook.com"]),
+                "outlook.com",
+            )
+            self.assertEqual(
+                register_outlook_standalone._preferred_outlook_domain([]),
+                "outlook.eu",
+            )
+
+    async def test_signup_inline_suffix_uses_prefix_only(self):
+        email_input = MagicMock()
+        email_input.evaluate = AsyncMock(return_value="Email\n@outlook.com")
+
+        domains = await register_outlook_standalone._signup_email_suffix_domains(
+            email_input
+        )
+        value = register_outlook_standalone._signup_email_entry_value(
+            "sampleuser", domains[0], page_manages_domain=bool(domains)
+        )
+
+        self.assertEqual(domains, ["outlook.com"])
+        self.assertEqual(value, "sampleuser")
+
+    async def test_react_fill_can_skip_native_validity_for_inline_email_suffix(self):
+        email_input = MagicMock()
+        email_input.count = AsyncMock(return_value=1)
+        email_input.click = AsyncMock()
+        email_input.press = AsyncMock()
+        email_input.input_value = AsyncMock(return_value="sampleuser")
+        email_input.evaluate = AsyncMock(return_value=False)
+        page = MagicMock()
+        page.locator.return_value.first = email_input
+        page.keyboard.type = AsyncMock()
+
+        with patch.object(browser_helpers.asyncio, "sleep", AsyncMock()):
+            strict = await browser_helpers.react_fill(
+                page, "input[type=email]", "sampleuser", tries=1, verbose=False
+            )
+            composite = await browser_helpers.react_fill(
+                page,
+                "input[type=email]",
+                "sampleuser",
+                tries=1,
+                verbose=False,
+                check_validity=False,
+            )
+
+        self.assertFalse(strict)
+        self.assertTrue(composite)
+
+    async def test_signup_dynamic_suffix_is_detected_after_blur(self):
+        email_input = MagicMock()
+        email_input.press = AsyncMock()
+        with (
+            patch.object(
+                register_outlook_standalone,
+                "_signup_email_suffix_domains",
+                AsyncMock(return_value=["outlook.com"]),
+            ),
+            patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()),
+        ):
+            domains = await register_outlook_standalone._signup_email_domains_after_blur(
+                email_input
+            )
+
+        self.assertEqual(domains, ["outlook.com"])
+        email_input.press.assert_awaited_once_with("Tab", timeout=1500)
+        self.assertEqual(
+            register_outlook_standalone._signup_email_entry_value(
+                "sampleuser@outlook.com", domains[0], page_manages_domain=True
+            ),
+            "sampleuser",
+        )
+
+    def test_signup_standard_email_field_includes_outlook_domain(self):
+        value = register_outlook_standalone._signup_email_entry_value(
+            "sampleuser", "outlook.com", page_manages_domain=False
+        )
+
+        self.assertEqual(value, "sampleuser@outlook.com")
+
+    async def test_signup_normal_footer_is_not_misread_as_email_taken(self):
+        email_input = MagicMock()
+        email_input.count = AsyncMock(return_value=1)
+        email_input.evaluate = AsyncMock(return_value={
+            "ariaInvalid": False,
+            "typeMismatch": False,
+            "patternMismatch": False,
+            "customError": False,
+            "message": "enter your email address. already have an account? sign in",
+            "visible": True,
+        })
+
+        rejection = await register_outlook_standalone._signup_email_rejected(
+            MagicMock(), email_input
+        )
+
+        self.assertEqual(rejection, "")
+
+    async def test_signup_native_email_type_mismatch_is_format_error(self):
+        email_input = MagicMock()
+        email_input.count = AsyncMock(return_value=1)
+        email_input.evaluate = AsyncMock(return_value={
+            "ariaInvalid": False,
+            "typeMismatch": True,
+            "patternMismatch": False,
+            "customError": False,
+            "message": "enter your email address in the format someone@example.com",
+            "visible": True,
+        })
+
+        rejection = await register_outlook_standalone._signup_email_rejected(
+            MagicMock(), email_input
+        )
+
+        self.assertEqual(rejection, "format")
+
+    async def test_signup_password_page_wins_over_stale_invalid_email_control(self):
+        password_input = MagicMock()
+        password_input.count = AsyncMock(return_value=1)
+        page = MagicMock()
+        page.locator.return_value.first = password_input
+
+        with patch.object(
+            register_outlook_standalone,
+            "_signup_email_rejected",
+            AsyncMock(return_value="format"),
+        ) as rejected:
+            result = await register_outlook_standalone._signup_email_submission_result(page)
+
+        self.assertEqual(result, "accepted")
+        rejected.assert_not_awaited()
+        self.assertIn(":visible", register_outlook_standalone._SIGNUP_EMAIL_SELECTOR)
+        self.assertIn(":visible", register_outlook_standalone._SIGNUP_PASSWORD_SELECTOR)
+
+    def test_hindi_and_indonesian_action_labels_are_available(self):
+        self.assertIn("स्वीकार करें", register_outlook_standalone.MS_POSITIVE_ACTION_LABELS)
+        self.assertIn("अस्वीकार करें", register_outlook_standalone.MS_NEGATIVE_ACTION_LABELS)
+        self.assertIn("terima", register_outlook_standalone.MS_POSITIVE_ACTION_LABELS)
+        self.assertIn("tolak", register_outlook_standalone.MS_NEGATIVE_ACTION_LABELS)
+
+    async def test_indonesian_device_app_consent_is_detected(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/Consent/Update?mkt=id-ID"
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value="Izinkan aplikasi ini mengakses info Anda? Tolak Izinkan"
+        )
+        page.locator.return_value = body
+        page.evaluate = AsyncMock(return_value="izinkan")
+        with patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, accepted = await (
+                register_outlook_standalone._accept_microsoft_app_consent(page, 15)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(accepted)
+        payload = page.evaluate.call_args.args[1]
+        self.assertIn("izinkan", payload["labels"])
+        self.assertIn("tolak", payload["negativeLabels"])
+
+    async def test_hindi_stay_signed_in_prompt_is_detected(self):
+        page = MagicMock()
+        page.url = "https://login.live.com/kmsi"
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value="क्या आप साइन इन रहना चाहते हैं? हाँ नहीं"
+        )
+        page.locator.return_value = body
+        page.evaluate = AsyncMock(return_value="हाँ")
+        with patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, continued = await (
+                register_outlook_standalone._handle_microsoft_kmsi(page, 16)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(continued)
+        payload = page.evaluate.call_args.args[1]
+        self.assertIn("हाँ", payload["labels"])
+        self.assertIn("नहीं", payload["negativeLabels"])
 
     def test_microsoft_urls_receive_locale_hints_without_losing_query(self):
         with patch.object(register_outlook_standalone, "MICROSOFT_UI_LOCALE", "en-US"):
@@ -536,6 +934,91 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
             page, context, "user@outlook.com", "password", 7
         )
 
+    async def test_registration_loop_creates_clean_tab_and_closes_startup_tabs(self):
+        first = MagicMock()
+        first.close = AsyncMock()
+        first.is_closed.return_value = False
+        extra = MagicMock()
+        extra.close = AsyncMock()
+        extra.is_closed.return_value = False
+        context = MagicMock(pages=[first, extra])
+        context.new_page = AsyncMock()
+
+        clean = MagicMock()
+        context.new_page.return_value = clean
+
+        page = await outlook_reg_loop._new_registration_page(context)
+
+        self.assertIs(page, clean)
+        context.new_page.assert_awaited_once()
+        first.close.assert_awaited_once()
+        extra.close.assert_awaited_once()
+
+    async def test_signup_navigation_retries_when_first_attempt_stays_blank(self):
+        page = MagicMock()
+        page.url = "about:blank"
+        page.evaluate = AsyncMock()
+
+        async def navigate(*args, **kwargs):
+            page.url = (
+                "about:blank"
+                if page.goto.await_count == 1
+                else "https://signup.live.com/signup?lic=1"
+            )
+
+        page.goto = AsyncMock(side_effect=navigate)
+        with patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            await register_outlook_standalone._navigate_to_signup(
+                page, "https://signup.live.com/signup?lic=1", "[#1]"
+            )
+
+        self.assertEqual(page.goto.await_count, 2)
+        page.evaluate.assert_awaited_once_with("() => window.stop()")
+
+    async def test_signup_navigation_accepts_a_committed_page_after_timeout(self):
+        page = MagicMock()
+        page.url = "about:blank"
+
+        async def navigate(*args, **kwargs):
+            page.url = "https://signup.live.com/signup?lic=1"
+            raise asyncio.TimeoutError("DOMContentLoaded was slow")
+
+        page.goto = AsyncMock(side_effect=navigate)
+        await register_outlook_standalone._navigate_to_signup(
+            page, "https://signup.live.com/signup?lic=1", "[#2]"
+        )
+
+        page.goto.assert_awaited_once()
+
+    async def test_attempt_uses_separate_registration_and_graph_timeouts(self):
+        completed = ("user@outlook.com", "password", [], {"refresh_token": "rt"})
+
+        async def finish_after_old_total_cap(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return completed
+
+        with patch.object(
+            outlook_reg_loop,
+            "one_attempt",
+            AsyncMock(side_effect=finish_after_old_total_cap),
+        ) as attempt:
+            result = await outlook_reg_loop._one_attempt_with_timeout(
+                MagicMock(),
+                "http://proxy.test:9000",
+                25,
+                registration_timeout=1,
+                graph_timeout=2,
+            )
+
+        self.assertEqual(result, completed)
+        attempt.assert_awaited_once_with(
+            unittest.mock.ANY,
+            "http://proxy.test:9000",
+            25,
+            registration_timeout=1,
+            graph_timeout=2,
+        )
+
     async def test_standalone_main_uses_device_browser_before_http_fallback(self):
         bb = MagicMock()
         results = []
@@ -575,6 +1058,76 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
         http_extract.assert_not_called()
         self.assertEqual(results[0]["status"], "OK")
         self.assertEqual(results[0]["graph"]["refresh_token"], "refresh-token")
+
+    async def test_terminal_graph_error_does_not_retry_credentials_over_http(self):
+        bb = MagicMock()
+        results = []
+        with (
+            patch.object(
+                register_outlook_standalone,
+                "register_outlook_protocol",
+                return_value=("user@outlook.com", "password"),
+            ),
+            patch.object(
+                register_outlook_standalone,
+                "extract_graph_token_browser",
+                AsyncMock(return_value={"terminal_error": "account_not_found"}),
+            ),
+            patch.object(
+                register_outlook_standalone,
+                "extract_graph_token_http",
+            ) as http_extract,
+        ):
+            await register_outlook_standalone.register_one(
+                bb,
+                1,
+                None,
+                results,
+                __import__("asyncio").Lock(),
+                mode="protocol",
+            )
+
+        http_extract.assert_not_called()
+        self.assertEqual(results[0]["status"], "GRAPH_FAIL")
+        self.assertEqual(results[0]["terminal_error"], "account_not_found")
+
+    async def test_retryable_graph_error_uses_http_fallback(self):
+        bb = MagicMock()
+        results = []
+        with (
+            patch.object(
+                register_outlook_standalone,
+                "register_outlook_protocol",
+                return_value=("user@outlook.com", "password"),
+            ),
+            patch.object(
+                register_outlook_standalone,
+                "extract_graph_token_browser",
+                AsyncMock(return_value={"terminal_error": "signin_rate_limited"}),
+            ),
+            patch.object(
+                register_outlook_standalone,
+                "extract_graph_token_http",
+                return_value={
+                    "refresh_token": "refresh-token",
+                    "client_id": "http-client-id",
+                },
+            ) as http_extract,
+        ):
+            await register_outlook_standalone.register_one(
+                bb,
+                1,
+                None,
+                results,
+                __import__("asyncio").Lock(),
+                mode="protocol",
+            )
+
+        http_extract.assert_called_once_with("user@outlook.com", "password", 1)
+        self.assertEqual(results[0]["status"], "OK")
+        self.assertEqual(
+            results[0]["graph"]["refresh_token"], "refresh-token"
+        )
 
     async def test_browser_registration_profile_is_reused_for_graph(self):
         bb = MagicMock()

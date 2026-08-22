@@ -30,12 +30,17 @@ from playwright.async_api import async_playwright
 
 import requests
 
-from bitbrowser import BitBrowser
-from common.browser import inject_stealth, create_browser_with_retry, human_type, react_fill
+from common.browser import (
+    human_type,
+    open_and_connect,
+    react_fill,
+    teardown,
+)
 from common.mailbox import get_code_by_token, get_code_outlook_pw, prelogin_outlook
 from common.cookies import save_platform_cookies
 from common import emails as email_pool
 from common import proxy_switch
+from common.traffic_saver import log_summary as log_traffic_summary
 
 # 打码平台 key（解 Cloudflare Turnstile）。config 顶部会加载 .env，真实环境变量优先。
 try:
@@ -223,16 +228,9 @@ async def inject_grok_stealth(context, page):
 
 def grok_browser_fingerprint():
     """Use the installed modern BitBrowser core and its native fingerprint."""
-    return {
-        "ostype": "PC",
-        "os": "Win32",
-        "coreVersion": GROK_BROWSER_CORE_VERSION,
-        "isIpCreateTimeZone": True,
-        "isIpCreateLanguage": True,
-        "isIpCreateDisplayLanguage": True,
-        "isIpCreatePosition": True,
-        "isIpCountry": True,
-    }
+    from common.fingerprint import browser_fingerprint
+
+    return browser_fingerprint("grok", GROK_BROWSER_CORE_VERSION)
 
 
 async def arm_turnstile_hook(context, page):
@@ -543,7 +541,11 @@ def register_via_protocol_rt(email, refresh_token, client_id, password, attempts
 def save_and_import_grok(sso, email, password, mark_pool=True, oauth_credentials=None):
     from common.session_export import save_grok_token
 
-    save_grok_token(sso, email)
+    save_grok_token(
+        sso,
+        email,
+        authorization_status="pending" if IMPORT_SUB2API else "not_requested",
+    )
     print("  [OK] grok sso token 已保存")
     if IMPORT_SUB2API:
         from common.token_upload_state import mark_uploaded
@@ -560,6 +562,12 @@ def save_and_import_grok(sso, email, password, mark_pool=True, oauth_credentials
             oauth_credentials=oauth_credentials,
         )
         print(f"  [{'OK' if ok else 'FAIL'}] {msg}")
+        save_grok_token(
+            sso,
+            email,
+            authorization_status="authorized" if ok else "failed",
+            announce=False,
+        )
         if not ok:
             print("  [hint] SSO 已保存，可修复配置后运行: python tools/upload_tokens.py grok")
             return False
@@ -567,6 +575,38 @@ def save_and_import_grok(sso, email, password, mark_pool=True, oauth_credentials
     if mark_pool:
         email_pool.mark_used(PLATFORM, email, password)
     return True
+
+
+def _recover_grok_sso_http(email: str, password: str) -> str | None:
+    """Recover SSO after browser signup when the xAI redirect missed cookies."""
+    from xconsole_client import XConsoleAuthClient
+
+    client = XConsoleAuthClient(
+        debug=False,
+        proxy=proxy_switch.effective_proxy_url(),
+        signup_url=GROK_SIGNUP_URL,
+        impersonate="chrome131",
+        timeout=40,
+    )
+    try:
+        # fetch_sso_token follows the current xAI set-cookie/RSC chain and does
+        # not create another account, so this is safe after browser signup.
+        client.visit_home()
+        token = client.fetch_sso_token(
+            email=email, password=password, save=False, retries=5
+        )
+        if token:
+            return token
+        client.load_signup_page()
+        return client.fetch_sso_token(
+            email=email, password=password, save=False, retries=3
+        )
+    finally:
+        client.close()
+
+
+async def recover_grok_sso_without_cookie(email: str, password: str) -> str | None:
+    return await asyncio.to_thread(_recover_grok_sso_http, email, password)
 
 
 async def wait_render(page, max_s=70):
@@ -843,49 +883,24 @@ async def prelogin_via_direct_browser(email, email_pw, p):
     import os
     if os.environ.get("MAILBOX_BROKER"):
         return None, None, None
-    bb = BitBrowser()
-    pid = None
+    bb = pid = ctx = None
     try:
-        pid = create_browser_with_retry(
-            bb,
+        bb, pid, _browser, ctx, page = await open_and_connect(
             f"mail_{time.strftime('%H%M%S')}",
-            browserFingerPrint=grok_browser_fingerprint(),
+            p=p,
+            browser_options={
+                "proxyType": "noproxy",
+                "browserFingerPrint": grok_browser_fingerprint(),
+            },
         )
-        if not pid:
-            return None, None, None
-        bb._post("/browser/update", {
-            "id": pid, "proxyMethod": 2, "proxyType": "noproxy",
-            "browserFingerPrint": grok_browser_fingerprint(),
-        })
-        data = None
-        for _ in range(8):
-            try:
-                data = bb.open_browser(pid)
-                break
-            except Exception:
-                await asyncio.sleep(4)
-        if not data:
-            return None, None, None
-        browser = await p.chromium.connect_over_cdp(data["ws"])
-        ctx = browser.contexts[0]
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await inject_stealth(ctx, page)
         ok = await prelogin_outlook(page, email, email_pw)
         if ok:
-            return bb, pid, page
+            return bb, pid, page, ctx
     except Exception as e:
         print(f"  [mail] prelogin error: {e}")
     # 失败：清理窗口
-    if pid:
-        try:
-            bb.close_browser(pid)
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-        try:
-            bb.delete_browser(pid)
-        except Exception:
-            pass
+    if bb and pid:
+        await teardown(bb, pid, delete=True)
     return None, None, None
 
 
@@ -904,7 +919,7 @@ async def get_code_via_direct_browser(email, email_pw, p, pre=None):
         )
     # 复用预登录窗口：已在收件箱，skip_login 直接轮询
     if pre and pre[2] is not None:
-        bb, pid, page = pre
+        bb, pid, page = pre[:3]
         try:
             return await get_code_outlook_pw(
                 page, email, email_pw,
@@ -916,43 +931,18 @@ async def get_code_via_direct_browser(email, email_pw, p, pre=None):
             print(f"  [mail] reuse prelogin error: {e}")
             return None
         finally:
-            if pid:
-                try:
-                    bb.close_browser(pid)
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-                try:
-                    bb.delete_browser(pid)
-                except Exception:
-                    pass
-    bb = BitBrowser()
-    pid = None
+            if bb and pid:
+                await teardown(bb, pid, delete=True)
+    bb = pid = ctx = None
     try:
-        pid = create_browser_with_retry(
-            bb,
+        bb, pid, _browser, ctx, page = await open_and_connect(
             f"mail_{time.strftime('%H%M%S')}",
-            browserFingerPrint=grok_browser_fingerprint(),
+            p=p,
+            browser_options={
+                "proxyType": "noproxy",
+                "browserFingerPrint": grok_browser_fingerprint(),
+            },
         )
-        if not pid:
-            return None
-        bb._post("/browser/update", {
-            "id": pid, "proxyMethod": 2, "proxyType": "noproxy",
-            "browserFingerPrint": grok_browser_fingerprint(),
-        })
-        data = None
-        for _ in range(8):
-            try:
-                data = bb.open_browser(pid)
-                break
-            except Exception:
-                await asyncio.sleep(4)
-        if not data:
-            return None
-        browser = await p.chromium.connect_over_cdp(data["ws"])
-        ctx = browser.contexts[0]
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await inject_stealth(ctx, page)
         return await get_code_outlook_pw(
             page, email, email_pw,
             sender_hint=GROK_SENDER, subject_hint=GROK_SUBJECT,
@@ -962,16 +952,8 @@ async def get_code_via_direct_browser(email, email_pw, p, pre=None):
         print(f"  [mail] direct browser error: {e}")
         return None
     finally:
-        if pid:
-            try:
-                bb.close_browser(pid)
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-            try:
-                bb.delete_browser(pid)
-            except Exception:
-                pass
+        if bb and pid:
+            await teardown(bb, pid, delete=True)
 
 
 async def register_one(index, total, p, node):
@@ -1027,8 +1009,7 @@ async def register_one(index, total, p, node):
     print(f"\n#{index}/{total} email={email}")
 
     name = f"grok_{time.strftime('%m%d_%H%M%S')}_{index}"
-    bb = BitBrowser()
-    pid = None
+    bb = pid = ctx = None
     success = False
 
     async def _protocol_fallback(reason):
@@ -1050,33 +1031,21 @@ async def register_one(index, total, p, node):
 
     try:
         # BitBrowser 走 Clash 代理。
-        pid = create_browser_with_retry(
-            bb, name, browserFingerPrint=grok_browser_fingerprint()
+        bb, pid, _browser, ctx, page = await open_and_connect(
+            name,
+            p=p,
+            browser_options={
+                **clash_browser_proxy_fields(),
+                "browserFingerPrint": grok_browser_fingerprint(),
+            },
         )
-        if not pid:
-            print("  create browser failed")
-            return None
         # 重新用代理配置更新窗口
-        bb._post("/browser/update", {
-            "id": pid, "name": name,
-            **clash_browser_proxy_fields(),
-            "browserFingerPrint": grok_browser_fingerprint(),
-        })
-        data = None
-        for _ in range(8):
-            try:
-                data = bb.open_browser(pid)
-                break
-            except Exception:
-                await asyncio.sleep(4)
-        if not data:
-            print("  open browser failed")
-            return None
-
-        browser = await p.chromium.connect_over_cdp(data["ws"])
-        ctx = browser.contexts[0]
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        print(f"  BitBrowser native fingerprint (core={GROK_BROWSER_CORE_VERSION})")
+        # BitBrowser may expose a stale zero-sized startup tab. Use a fresh
+        # page for xAI auth so routing and viewport settle before navigation.
+        print(
+            f"  {getattr(bb, 'provider_name', 'browser')} native fingerprint "
+            f"(core={GROK_BROWSER_CORE_VERSION})"
+        )
         email_rpc_statuses = []
 
         def _capture_email_rpc(response):
@@ -1257,6 +1226,7 @@ async def register_one(index, total, p, node):
             print(f"  [5] get code via temp-email API ({temp_mb['provider']}: {email})")
             code = await poll_verification_code(
                 temp_mb["id"], temp_mb["provider"], email=email, token=temp_mb.get("token"),
+                api_key=temp_mb.get("api_key"), base_url=temp_mb.get("base_url"),
                 max_wait=150, poll_interval=5,
                 sender_hint=GROK_SENDER, subject_hint=GROK_SUBJECT,
                 code_regex=GROK_CODE_REGEX,
@@ -1427,7 +1397,8 @@ async def register_one(index, total, p, node):
             print("  [6] 仍停在 sign-up 页（Turnstile 未过 / 提交被拦）")
         check_timeout()
 
-        # 回到 grok.com 确保 cookie 落到主域
+        # 回到 grok.com 确保 cookie 落到主域；xAI 会异步完成 auth cookie
+        # 写入，先给重定向链一小段时间，避免刚到首页就误判失败。
         if "grok.com" not in page.url:
             try:
                 await page.goto("https://grok.com/", timeout=45000, wait_until="domcontentloaded")
@@ -1436,6 +1407,26 @@ async def register_one(index, total, p, node):
         else:
             await asyncio.sleep(2)
         await dump_state(page, "final")
+
+        key_val = None
+        for cookie_attempt in range(1, 7):
+            try:
+                cookies = await ctx.cookies()
+                key_val = next(
+                    (
+                        item.get("value")
+                        for item in cookies
+                        if item.get("name") in KEY_COOKIES and item.get("value")
+                    ),
+                    None,
+                )
+            except Exception:
+                key_val = None
+            if key_val:
+                break
+            if cookie_attempt < 6:
+                print(f"  [grok] auth cookie pending ({cookie_attempt}/5), waiting...")
+                await asyncio.sleep(2)
 
         key_val, _ = await save_platform_cookies(
             ctx, PLATFORM, pid, email=email, password=password, key_cookie_names=KEY_COOKIES
@@ -1460,7 +1451,24 @@ async def register_one(index, total, p, node):
             print("  [OK] session cookie saved")
             return key_val
         else:
-            print("  [FAIL] no session cookie")
+            print("  [grok] browser redirect had no session cookie; trying HTTP SSO recovery")
+            try:
+                recovered_sso = await recover_grok_sso_without_cookie(email, password)
+            except Exception as exc:
+                print(f"  [grok] HTTP SSO recovery error: {str(exc)[:120]}")
+                recovered_sso = None
+            if recovered_sso:
+                if not save_and_import_grok(
+                    recovered_sso,
+                    email,
+                    password,
+                    mark_pool=temp_mb is None,
+                ):
+                    return None
+                success = True
+                print("  [OK] SSO recovered through xAI HTTP cookie chain")
+                return recovered_sso
+            print("  [FAIL] no session cookie or recoverable SSO")
             _mark_error("no_session_cookie")
             return None
 
@@ -1470,20 +1478,22 @@ async def register_one(index, total, p, node):
             _mark_error(str(e)[:50])
         return None
     finally:
+        if ctx is not None:
+            log_traffic_summary(ctx)
         if pid:
             keep = KEEP_ON_FAIL and not success
-            try:
-                bb.close_browser(pid)
-            except Exception:
-                pass
-            await asyncio.sleep(2)
             if not keep:
-                try:
-                    bb.delete_browser(pid)
-                except Exception:
-                    pass
+                await teardown(bb, pid, delete=True)
             else:
-                print(f"  [debug] window kept: {name} (id={pid})")
+                if getattr(bb, "provider_name", "") == "cloak":
+                    print("  [debug] CloakBrowser keep-on-fail is not supported; closing profile")
+                    await teardown(bb, pid, delete=True)
+                else:
+                    try:
+                        bb.close_browser(pid)
+                    except Exception:
+                        pass
+                    print(f"  [debug] window kept: {name} (id={pid})")
 
 
 async def main():
@@ -1528,7 +1538,7 @@ async def main():
     # 选节点过 grok CF：--node 指定则用它，否则自动探测能过的节点
     try:
         if args.node and args.node.lower() != "auto":
-            proxy_switch.set_node(args.node)
+            proxy_switch.pin_fixed_node(args.node, "grok")
             time.sleep(2)
             print(f"  使用指定节点 -> {proxy_switch.current_node()}")
         else:
@@ -1546,20 +1556,32 @@ async def main():
         print(f"  切节点失败(确认 Clash 在跑): {e}")
         return False
 
-    sem = asyncio.Semaphore(args.concurrency)
+    from common.concurrency import build_worker_plan
+    from common.task_context import activate_worker
+
+    worker_plan = build_worker_plan("grok", args.count, args.concurrency)
+    worker_plan.log()
+    slot_locks = [asyncio.Lock() for _ in range(worker_plan.effective_concurrency)]
     results = []
 
     async def run_one(i):
-        async with sem:
-            if i > 1:
-                await asyncio.sleep(random.uniform(3, 8) * (i - 1))
-            async with async_playwright() as p:
-                try:
-                    sk = await register_one(i, args.count, p, args.node)
-                    results.append(sk)
-                except Exception as e:
-                    print(f"  #{i} fatal: {e}")
-                    results.append(None)
+        stagger_slot = (i - 1) % worker_plan.effective_concurrency
+        if stagger_slot:
+            await asyncio.sleep(random.uniform(2.0, 4.0) * stagger_slot)
+        worker_context = worker_plan.worker(i)
+        async with slot_locks[worker_context.slot - 1]:
+            with activate_worker(worker_context) as worker:
+                print(
+                    f"  [worker] {worker.worker_id} slot={worker.slot} "
+                    f"proxy={proxy_switch.current_node()}"
+                )
+                async with async_playwright() as p:
+                    try:
+                        sk = await register_one(i, args.count, p, args.node)
+                        results.append(sk)
+                    except Exception as e:
+                        print(f"  #{i} fatal: {e}")
+                        results.append(None)
 
     await asyncio.gather(*[run_one(i) for i in range(1, args.count + 1)])
 

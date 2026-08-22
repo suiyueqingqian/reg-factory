@@ -13,18 +13,24 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import io
 import importlib.util
 import json
 import os
+import re
 import signal
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -52,6 +58,77 @@ PLUS_DIR = os.path.join(ROOT, "vendor", "chatgpt_plus")
 sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
 from webui import scripts as schema  # noqa: E402
+
+
+# The updater inherits the current service environment.  Values originally
+# loaded from .env can therefore look like explicit boot-time overrides after
+# a restart and mask newer settings saved from the WebUI.  The network panel
+# is the runtime control plane for these keys, so its saved values must remain
+# authoritative for both this process and newly spawned registration tasks.
+_PROXY_ENV_KEYS = (
+    "PROXY_MODE",
+    "REG_FACTORY_PROXY_MODE",
+    "OUTLOOK_PROXY_MODE",
+    "CLAUDE_PROXY_MODE",
+    "CHATGPT_PROXY_MODE",
+    "GROK_PROXY_MODE",
+    "KIRO_PROXY_MODE",
+    "GITHUB_PROXY_MODE",
+    "CLASH_API",
+    "CLASH_SECRET",
+    "CLASH_PROXY",
+    "CLASH_GROUP",
+    "CLASH_FIXED_NODE",
+    "REG_FACTORY_PLUS_LINK_ROUTE",
+    "REG_FACTORY_PLUS_BIND_ROUTE",
+    "REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE",
+    "REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE",
+    "REG_FACTORY_PROXY",
+    "REG_FACTORY_PROXY_POOL",
+    "REG_FACTORY_PROXY_ROTATE_URL",
+    "REG_FACTORY_PROXY_ROTATE_METHOD",
+    "REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE",
+    "REG_FACTORY_MAX_CONCURRENCY",
+    "REG_FACTORY_ALLOW_SHARED_EGRESS",
+    "CHATGPT_RESIDENTIAL_ROTATE_RETRIES",
+)
+
+_CUSTOM_BROWSER_ENV_KEYS = {
+    "FINGERPRINT_BROWSER",
+    "CUSTOM_BROWSER_API",
+    "CUSTOM_BROWSER_API_MODE",
+    "CUSTOM_BROWSER_API_KEY",
+    "CUSTOM_BROWSER_API_AUTH_HEADER",
+    "CUSTOM_BROWSER_API_AUTH_PREFIX",
+    "CUSTOM_BROWSER_API_HEADERS",
+    "CUSTOM_BROWSER_API_TIMEOUT",
+    "CUSTOM_BROWSER_API_VERIFY_TLS",
+    "CUSTOM_BROWSER_API_ID_FIELD",
+    "CUSTOM_BROWSER_API_HEALTH_PATH",
+    "CUSTOM_BROWSER_API_CREATE_PATH",
+    "CUSTOM_BROWSER_API_LIST_PATH",
+    "CUSTOM_BROWSER_API_OPEN_PATH",
+    "CUSTOM_BROWSER_API_CLOSE_PATH",
+    "CUSTOM_BROWSER_API_DELETE_PATH",
+    "CUSTOM_BROWSER_API_UPDATE_PATH",
+    "CUSTOM_BROWSER_API_CREATE_METHOD",
+    "CUSTOM_BROWSER_API_LIST_METHOD",
+    "CUSTOM_BROWSER_API_OPEN_METHOD",
+    "CUSTOM_BROWSER_API_CLOSE_METHOD",
+    "CUSTOM_BROWSER_API_DELETE_METHOD",
+    "CUSTOM_BROWSER_API_UPDATE_METHOD",
+    "CUSTOM_BROWSER_API_FORWARD_FIELDS",
+}
+
+# The same updater inheritance problem affects provider credentials after they
+# are edited in the WebUI.  Keep this list narrow so unrelated explicit system
+# environment overrides retain their existing precedence.
+_LIVE_ENV_KEYS = frozenset(_PROXY_ENV_KEYS) | _CUSTOM_BROWSER_ENV_KEYS | {
+    "ICLOUD_MAIL_API_BASE",
+    "ICLOUD_MAIL_API_KEY",
+    "ICLOUD_MAIL_TYPE",
+    "ICLOUD_MAIL_SERVICE",
+}
 
 
 def _asset_api_denied(request: Request):
@@ -149,7 +226,6 @@ K12_PROCESS = None
 K12_LOG_HANDLE = None
 K12_START_TASK = None
 K12_LOCK = asyncio.Lock()
-RUYIPAGE_INSTALL_TASK = None
 
 # Plus 工作台使用内置 zkky 服务；网络出口优先住宅 IP，缺失时回退 Clash。
 PLUS_PORT = 5601
@@ -167,24 +243,42 @@ ASSET_SCAN_STATE = {
     "finished_at": "",
     "error": "",
     "progress": {"completed": 0, "total": 0, "current": ""},
+    "quarantine": {"moved_accounts": 0, "moved_files": 0},
 }
 ASSET_SCAN_LOCK = threading.Lock()
 
 # 更新由独立进程执行；当前 WebUI 会在 updater 停止自身前返回 202。
 UPDATE_PROCESS = None
 UPDATE_LOG_HANDLE = None
+UPDATE_RESULT_PATH = os.path.join(
+    os.environ.get("REG_FACTORY_DATA_DIR", "").strip() or ROOT,
+    "runtime",
+    "update-result.json",
+)
 UPDATE_STATE = {
     "status": "idle",
     "message": "",
     "started_at": "",
 }
+try:
+    with open(UPDATE_RESULT_PATH, encoding="utf-8-sig") as handle:
+        _previous_update_result = json.load(handle)
+    _previous_update_status = str(_previous_update_result.get("status") or "").lower()
+    if _previous_update_status in {"completed", "up_to_date", "failed"}:
+        UPDATE_STATE.update({
+            "status": "completed" if _previous_update_status != "failed" else "failed",
+            "message": str(_previous_update_result.get("message") or "")[:240],
+            "started_at": str(_previous_update_result.get("updated_at") or ""),
+        })
+except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+    pass
 
 
 # ============================================================ 配置/状态读取
-def _read_config_val(key, default=""):
+def _read_config_val(key, default="", allow_empty=False):
     """从环境/.env 读一个值(用于探测 Clash/BitBrowser 地址)。"""
     val = os.environ.get(key)
-    if val:
+    if val or (allow_empty and key in os.environ):
         return val
     try:
         with open(ENV_PATH, encoding="utf-8") as handle:
@@ -193,19 +287,25 @@ def _read_config_val(key, default=""):
                 if line and not line.startswith("#") and "=" in line:
                     k, _, v = line.partition("=")
                     if k.strip() == key:
-                        return v.strip().strip('"').strip("'") or default
+                        value = v.strip().strip('"').strip("'")
+                        return value if allow_empty else (value or default)
     except Exception:
         pass
     return default
 
 
-def _http_alive(url, timeout=3):
+def _http_alive(url, timeout=3, headers=None, verify_tls=True):
     try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        req = urllib.request.Request(url, headers=headers or {})
+        handlers = [urllib.request.ProxyHandler({})]
+        if not verify_tls:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as r:
             return r.status < 500
-    except urllib.error.HTTPError:
-        return True  # 4xx = 服务活着(拒绝裸请求)
+    except urllib.error.HTTPError as exc:
+        if headers and exc.code in {401, 403}:
+            return False
+        return True  # 其他 4xx = 服务活着(拒绝裸请求)
     except Exception:
         return False
 
@@ -275,37 +375,49 @@ def _plus_health():
 
 
 def _plus_status(message=""):
-    health = _plus_health()
-    alive = bool(health)
-    required = (
-        os.path.join(PLUS_DIR, "server.py"),
-        os.path.join(PLUS_DIR, "standalone_flow.py"),
-        os.path.join(PLUS_DIR, "index.html"),
+    sub2api_ready = all(
+        _read_config_val(key, "").strip()
+        for key in ("SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD")
     )
-    ready = all(os.path.isfile(path) for path in required)
-    managed = bool(PLUS_SERVER_THREAD and PLUS_SERVER_THREAD.is_alive())
-    detail = (
-        "本地工作台在线" if alive else
-        message if message else
-        "内置 zkky 文件不完整" if not ready else
-        "本地工作台尚未启动"
+    providers = []
+    if _read_config_val("SMSMAN_TOKEN", "").strip():
+        providers.append("smsman")
+    if (
+        _read_config_val("SMS_TOKEN", "").strip()
+        and _read_config_val("SMS_PROJECT_ID_OPENAI", "").strip()
+    ):
+        providers.append("firefox")
+    if _read_config_val("HERO_SMS_API_KEY", "").strip():
+        providers.append("hero")
+    active = sum(
+        1 for rec in RUNS.values()
+        if rec.get("script") == "plus_codex_import" and not rec.get("done")
+    )
+    ready = sub2api_ready and bool(providers)
+    detail = message or (
+        f"正在导入 {active} 个批次" if active else
+        "Plus Codex 批量导入已就绪" if ready else
+        "请先配置 SUB2API 和至少一个手机号接码平台"
     )
     return {
-        "alive": alive,
+        "alive": ready,
         "ready": ready,
-        "managed": managed,
-        "url": "/chatgpt-plus/",
-        "batch_size": PLUS_BATCH_SIZE,
+        "managed": bool(active),
+        "active": active,
+        "providers": providers,
+        "sub2api_ready": sub2api_ready,
         "message": detail,
     }
 
 
-def _update_script():
-    if getattr(sys, "frozen", False) and os.name == "nt":
+def _update_script(result_path=""):
+    if getattr(sys, "frozen", False):
+        if os.name != "nt":
+            return None
         path = os.path.join(ROOT, "update-portable.ps1")
         if not os.path.isfile(path):
             return None
-        return [
+        command = [
             shutil.which("powershell.exe") or "powershell.exe",
             "-NoProfile",
             "-ExecutionPolicy",
@@ -317,6 +429,20 @@ def _update_script():
             "-ProcessId",
             str(os.getpid()),
         ]
+        if result_path:
+            command.extend(["-ResultPath", result_path])
+        for option, default in (("--host", "127.0.0.1"), ("--port", "8799")):
+            value = default
+            try:
+                index = sys.argv.index(option)
+                value = sys.argv[index + 1]
+            except (ValueError, IndexError):
+                pass
+            command.extend([
+                "-ListenHost" if option == "--host" else "-ListenPort",
+                str(value),
+            ])
+        return command
     if os.name == "nt":
         path = os.path.join(ROOT, "update.ps1")
         if not os.path.isfile(path):
@@ -337,21 +463,84 @@ def _update_script():
     return ["bash", path, "--root", ROOT]
 
 
+def _update_child_env():
+    """Keep registration proxies out of GitHub update subprocesses."""
+    child_env = os.environ.copy()
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        child_env.pop(name, None)
+    bypass = [
+        value.strip()
+        for value in str(child_env.get("NO_PROXY") or child_env.get("no_proxy") or "").split(",")
+        if value.strip()
+    ]
+    for host in ("127.0.0.1", "localhost", "::1", "github.com", "api.github.com", "uploads.github.com"):
+        if host not in bypass:
+            bypass.append(host)
+    child_env["NO_PROXY"] = child_env["no_proxy"] = ",".join(bypass)
+    child_env["REG_FACTORY_NONINTERACTIVE"] = "1"
+    return child_env
+
+
+def _read_update_result():
+    if not UPDATE_RESULT_PATH or not os.path.isfile(UPDATE_RESULT_PATH):
+        return {}
+    try:
+        with open(UPDATE_RESULT_PATH, encoding="utf-8-sig") as handle:
+            result = json.load(handle)
+        return result if isinstance(result, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def _update_status():
     global UPDATE_PROCESS, UPDATE_LOG_HANDLE
     process = UPDATE_PROCESS
     if process is not None:
         returncode = process.poll()
         if returncode is None:
+            result = _read_update_result()
+            result_status = str(result.get("status") or "").strip().lower()
+            target = str(result.get("target_version") or "").strip()
+            stage_messages = {
+                "checking": "正在检查最新版本",
+                "downloading": f"正在下载 v{target}" if target else "正在下载最新版本",
+                "installing": f"正在安装 v{target}" if target else "正在安装最新版本",
+            }
             UPDATE_STATE["status"] = "running"
-            UPDATE_STATE["message"] = "正在下载并安装最新版本"
+            UPDATE_STATE["message"] = str(
+                stage_messages.get(result_status)
+                or result.get("message")
+                or "正在下载并安装最新版本"
+            )[:240]
         elif UPDATE_STATE["status"] == "running":
-            UPDATE_STATE["status"] = "completed" if returncode == 0 else "failed"
-            UPDATE_STATE["message"] = (
-                "更新进程已完成，面板即将重启"
-                if returncode == 0
-                else f"更新失败（退出码 {returncode}），请查看 update.log"
-            )
+            result = _read_update_result()
+            result_status = str(result.get("status") or "").strip().lower()
+            if returncode == 0 and result_status in {"completed", "up_to_date"}:
+                UPDATE_STATE["status"] = "completed"
+                current = str(result.get("current_version") or "").strip()
+                target = str(result.get("target_version") or "").strip()
+                if result_status == "up_to_date":
+                    version = current or target
+                    UPDATE_STATE["message"] = f"已是最新版本 v{version}" if version else "已是最新版本"
+                else:
+                    UPDATE_STATE["message"] = (
+                        f"更新完成：v{current} -> v{target}"
+                        if current and target
+                        else "更新程序已完成"
+                    )
+            else:
+                UPDATE_STATE["status"] = "failed"
+                UPDATE_STATE["message"] = str(
+                    result.get("message")
+                    or f"更新失败（退出码 {returncode}），请查看 runtime/update.log"
+                )[:240]
             if UPDATE_LOG_HANDLE:
                 UPDATE_LOG_HANDLE.close()
                 UPDATE_LOG_HANDLE = None
@@ -487,16 +676,12 @@ def _plus_runtime_environment():
     data_root = os.path.abspath(os.environ.get("REG_FACTORY_DATA_DIR") or ROOT)
     runtime_dir = os.path.join(data_root, "runtime", "chatgpt_plus")
     os.makedirs(runtime_dir, exist_ok=True)
-    residential = _plus_residential_proxy_url(env)
     clash = str(env.get("CLASH_PROXY") or "http://127.0.0.1:7897").strip()
-    link_route = str(
-        env.get("REG_FACTORY_PLUS_LINK_ROUTE")
-        or ("residential" if residential else "clash")
-    ).strip()
-    bind_route = str(
-        env.get("REG_FACTORY_PLUS_BIND_ROUTE")
-        or ("clash" if clash else "residential")
-    ).strip()
+    # Plus checkout and payment stay on the selected ChatGPT egress by
+    # default. A residential route remains available only when explicitly
+    # requested through REG_FACTORY_PLUS_*_ROUTE or *_PROXY_OVERRIDE.
+    link_route = str(env.get("REG_FACTORY_PLUS_LINK_ROUTE") or "clash").strip()
+    bind_route = str(env.get("REG_FACTORY_PLUS_BIND_ROUTE") or "clash").strip()
     link_proxy = str(
         env.get("REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE")
         or _plus_route_proxy_url(env, link_route, _plus_proxy_url(env))
@@ -666,7 +851,7 @@ def _write_env_file(path, updates):
 def _apply_saved_env(updates):
     """让当前 WebUI 与后续子进程看到新配置，同时保留启动前系统变量的优先级。"""
     for key, value in updates.items():
-        if key in BOOT_ENV:
+        if key in BOOT_ENV and key not in _LIVE_ENV_KEYS:
             continue
         if value == "":
             os.environ.pop(key, None)
@@ -674,7 +859,18 @@ def _apply_saved_env(updates):
             os.environ[key] = value
 
     import importlib
-    for name in ("config", "common.direct_proxy", "common.proxy_switch", "common.sms", "common.temp_email"):
+    # Provider adapters cache environment-backed defaults at import time. They
+    # must be reloaded together with config so changing the fingerprint browser
+    # in the WebUI takes effect for the next connectivity check/worker.
+    for name in (
+        "config",
+        "common.direct_proxy",
+        "common.proxy_switch",
+        "common.sms",
+        "common.temp_email",
+        "common.cloak_browser",
+        "common.roxy_browser",
+    ):
         module = sys.modules.get(name)
         if module is not None:
             importlib.reload(module)
@@ -695,11 +891,13 @@ def _apply_saved_env(updates):
 
 
 # ============================================================ 连通测试
-def _direct_get(url, headers=None, timeout=8):
+def _direct_get(url, headers=None, timeout=8, verify_tls=True):
     """直连 GET(显式绕过代理——Clash 控制器/BitBrowser 都是 localhost)。
     返回 (status_code, body_text)。连不上抛异常。"""
-    handler = urllib.request.ProxyHandler({})  # 空 = 不走任何代理
-    opener = urllib.request.build_opener(handler)
+    handlers = [urllib.request.ProxyHandler({})]  # 空 = 不走任何代理
+    if not verify_tls:
+        handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(url, headers=headers or {})
     with opener.open(req, timeout=timeout) as r:
         return r.status, r.read(8192).decode("utf-8", "replace")
@@ -736,28 +934,35 @@ def _test_clash():
 
 def _fingerprint_provider():
     return (
-        _read_config_val("FINGERPRINT_BROWSER", "ruyipage")
+        _read_config_val("FINGERPRINT_BROWSER", "bitbrowser")
         or os.environ.get("BROWSER_PROVIDER")
-        or "ruyipage"
+        or "bitbrowser"
     ).strip().lower()
 
 
 def _test_bitbrowser():
     """Test selected fingerprint browser local API."""
     provider = _fingerprint_provider()
-    if provider in {"ruyipage", "ruyi", "firefox_bidi"}:
+    headers = {}
+    verify_tls = True
+    if provider in {"cloak", "cloakbrowser"}:
         try:
-            import ruyipage
-            from common.ruyipage_runtime import ensure_runtime
+            import importlib.util
 
-            configured = _read_config_val("RUYIPAGE_BROWSER_PATH", "")
-            result = ensure_runtime(configured)
-            path = result.get("path", "")
-            if path:
-                return True, f"RuyiPage {ruyipage.__version__} Firefox ready: {os.path.basename(path)}"
+            if importlib.util.find_spec("cloakbrowser") is None:
+                return False, "未安装 CloakBrowser，请执行 pip install \"cloakbrowser[geoip]>=0.4.10\""
+            return True, "CloakBrowser 已安装，可启动原生指纹环境"
         except Exception as exc:
-            return False, f"RuyiPage 不可用: {str(exc)[:100]}"
-        return False, "RuyiPage Firefox runtime 未安装；请运行面板中的安装任务"
+            return False, f"CloakBrowser 检测失败: {str(exc)[:120]}"
+    if provider in {"roxy", "roxybrowser"}:
+        api = _read_config_val("ROXY_API_BASE", "http://127.0.0.1:50100").rstrip("/")
+        token = _read_config_val("ROXY_API_TOKEN", "").strip()
+        if token:
+            headers = {"token": token, "Authorization": f"Bearer {token}"}
+        for path in ("/status", "/", "/browser/workspace"):
+            if _http_alive(api + path, timeout=5, headers=headers):
+                return True, f"RoxyBrowser API 连通: {api}"
+        return False, f"RoxyBrowser API 不可达: {api}"
     if provider in {"bundled", "embedded", "local", "custom", "chrome", "chromium"}:
         from common.bundled_browser import find_browser_path
 
@@ -774,16 +979,49 @@ def _test_bitbrowser():
         if not api:
             return False, "CUSTOM_BROWSER_API 未配置"
         name = "Custom Browser"
-        paths = ("/health", "/")
+        health = _read_config_val("CUSTOM_BROWSER_API_HEALTH_PATH", "/health").strip() or "/health"
+        paths = (health, "/status", "/")
+        key = (_read_config_val("CUSTOM_BROWSER_API_KEY", "") or _read_config_val("CUSTOM_BROWSER_API_TOKEN", "")).strip()
+        header = _read_config_val("CUSTOM_BROWSER_API_AUTH_HEADER", "Authorization").strip() or "Authorization"
+        prefix = _read_config_val("CUSTOM_BROWSER_API_AUTH_PREFIX", "Bearer ", allow_empty=True)
+        if prefix.strip().lower() in {"bearer", "token", "basic", "apikey", "api-key"}:
+            prefix = prefix.strip() + " "
+        headers = {header: f"{prefix}{key}"} if key else {}
+        extra_headers = _read_config_val("CUSTOM_BROWSER_API_HEADERS", "").strip()
+        if extra_headers:
+            try:
+                value = json.loads(extra_headers)
+                if not isinstance(value, dict):
+                    raise ValueError("must be a JSON object")
+                headers.update({str(item_key): str(item_value) for item_key, item_value in value.items()})
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                return False, f"CUSTOM_BROWSER_API_HEADERS JSON 无效: {exc}"
+        verify_tls = _read_config_val("CUSTOM_BROWSER_API_VERIFY_TLS", "true").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
     else:
         api = _read_config_val("BITBROWSER_API", "http://127.0.0.1:54345").rstrip("/")
         name = "BitBrowser"
         paths = ("/health", "/")
+        headers = {}
     for path in paths:
         try:
-            code, _ = _direct_get(api + path, timeout=5)
+            target = path if path.startswith(("http://", "https://")) else api + (
+                path if path.startswith("/") else "/" + path
+            )
+            code, _ = _direct_get(
+                target,
+                headers=headers,
+                timeout=5,
+                verify_tls=verify_tls,
+            )
             return True, f"{name} API 连通 ✓ (HTTP {code})"
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            if provider in {"custom_api", "api"} and exc.code in {401, 403}:
+                return False, f"{name} API 鉴权失败 (HTTP {exc.code})，请检查 Key、请求头和前缀"
+            if provider in {"custom_api", "api"} and exc.code in {404, 405}:
+                last = f"HTTP {exc.code}"
+                continue
             return True, f"{name} API 在线 ✓ (服务响应)"
         except Exception as e:
             last = str(e)[:60]
@@ -876,11 +1114,11 @@ def _test_outlook_recovery_mailbox():
     if not record:
         return False, "请先填写 OUTLOOK_GRAPH_RECOVERY_OUTLOOK_MAILBOX"
     try:
-        from common.mailbox import check_refresh_token, parse_outlook_recovery_mailbox
+        from common.mailbox import check_mailbox_access, parse_outlook_recovery_mailbox
 
         mailbox = parse_outlook_recovery_mailbox(record)
-        validation = check_refresh_token(
-            mailbox["refresh_token"], mailbox["client_id"]
+        validation = check_mailbox_access(
+            mailbox["email"], mailbox["refresh_token"], mailbox["client_id"]
         )
         if not validation.get("ok"):
             return False, "Graph API 验证失败: " + str(
@@ -918,7 +1156,7 @@ async def api_test(target: str, request: Request):
     saved = {}
     allowed = set(schema.env_keys()) | {"SMSMAN_API_BASE", "SMS_API_BASE"}
     for k, v in overrides.items():
-        if k in allowed and v not in (None, ""):
+        if k in allowed and v is not None and (v != "" or k in _CUSTOM_BROWSER_ENV_KEYS):
             saved[k] = os.environ.get(k)
             os.environ[k] = str(v)
     try:
@@ -948,18 +1186,31 @@ def api_asset_summary(request: Request):
 
 
 @app.get("/api/assets/emails")
-def api_asset_email(request: Request, index: int | None = None, format: str = "json"):
+def api_asset_email(
+    request: Request,
+    index: int | None = None,
+    format: str = "json",
+    email_provider: str = "",
+    pristine_only: bool = False,
+    normal_only: bool = False,
+    no_graph_only: bool = False,
+    status: str = "",
+):
     denied = _asset_api_denied(request)
     if denied:
         return denied
+    from common import asset_store
+
     return _asset_result(
-        lambda: _get_verified_asset(
-            "outlook",
-            lambda asset_store: asset_store.get_email(
-                index=index,
-                output_format=format,
-                verified_only=True,
-            ),
+        lambda: asset_store.get_email(
+            index=index,
+            output_format=format,
+            claim_once=True,
+            email_provider=email_provider,
+            pristine_only=pristine_only,
+            no_graph_only=no_graph_only,
+            verified_only=normal_only and not no_graph_only and not bool(str(status).strip()),
+            status=status,
         )
     )
 
@@ -970,19 +1221,24 @@ def api_asset_cookie(
     request: Request,
     format: str = "raw",
     index: int | None = None,
+    codex_phone_status: str = "",
+    email_provider: str = "",
+    status: str = "",
 ):
     denied = _asset_api_denied(request)
     if denied:
         return denied
+    from common import asset_store
+
     return _asset_result(
-        lambda: _get_verified_asset(
+        lambda: asset_store.get_platform_asset(
             platform,
-            lambda asset_store: asset_store.get_platform_asset(
-                platform,
-                output_format=format,
-                index=index,
-                verified_only=True,
-            ),
+            output_format=format,
+            index=index,
+            claim_once=True,
+            codex_phone_status=codex_phone_status,
+            email_provider=email_provider,
+            status=status,
         )
     )
 
@@ -1002,14 +1258,120 @@ async def api_asset_cursor_reset(request: Request):
     return _asset_result(lambda: asset_store.reset_cursor(scope))
 
 
-def _asset_scan_payload():
-    from common import asset_scanner
+def _asset_export_zip(results: list[dict], resource: str, output_format: str) -> bytes:
+    buffer = io.BytesIO()
+    manifest = []
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if resource == "emails" or output_format == "email_four":
+            if output_format == "json":
+                archive.writestr(
+                    "emails.json",
+                    json.dumps([item.get("data") for item in results], ensure_ascii=False, indent=2),
+                )
+            else:
+                lines = [str(item.get("data") or "") for item in results]
+                name = "chatgpt-registration-emails.txt" if resource == "chatgpt" else "emails.txt"
+                archive.writestr(name, "\n".join(lines) + "\n")
+            manifest.extend({
+                "platform": resource if resource != "emails" else "outlook",
+                "email": str(item.get("email") or ""),
+                "source": str(item.get("source") or ""),
+                "format": output_format,
+            } for item in results)
+        else:
+            for index, item in enumerate(results, start=1):
+                data = item.get("data")
+                extension = "txt" if isinstance(data, str) else "json"
+                email = str(item.get("email") or item.get("source") or f"account-{index}")
+                safe_name = re.sub(r"[^a-zA-Z0-9@._-]+", "-", email).strip("-.") or f"account-{index}"
+                preferred = str(item.get("file_name") or "").strip()
+                if preferred:
+                    safe_name = re.sub(r"[^a-zA-Z0-9@._-]+", "-", os.path.basename(preferred)).strip("-.")
+                    if safe_name.lower().endswith(f".{extension}"):
+                        safe_name = safe_name[: -(len(extension) + 1)]
+                payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
+                archive.writestr(f"{resource}/{index:04d}-{safe_name}.{extension}", payload)
+                manifest.append({
+                    "platform": resource,
+                    "email": str(item.get("email") or ""),
+                    "source": str(item.get("source") or ""),
+                    "format": output_format,
+                })
+        archive.writestr(
+            "manifest.json",
+            json.dumps({"resource": resource, "format": output_format, "count": len(results), "items": manifest}, ensure_ascii=False, indent=2),
+        )
+    return buffer.getvalue()
 
-    report = asset_scanner.get_report()
-    report["scan"] = {
+
+@app.post("/api/assets/export")
+async def api_asset_export(request: Request):
+    denied = _asset_api_denied(request)
+    if denied:
+        return denied
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "request body must be an object"}, status_code=400)
+    resource = str(data.get("resource") or "emails").strip().lower()
+    output_format = str(data.get("format") or ("four" if resource == "emails" else "raw")).strip().lower()
+    consume = data.get("consume", True)
+    status = data.get("status", "")
+    normal_only = data.get("normal_only", not bool(str(status).strip()))
+    include_claimed = data.get("include_claimed", consume)
+    if not all(isinstance(value, bool) for value in (consume, normal_only, include_claimed)):
+        return JSONResponse({"error": "consume, normal_only and include_claimed must be boolean"}, status_code=400)
+    from common import asset_store
+
+    try:
+        def build_export():
+            results = asset_store.export_batch(
+                resource,
+                output_format=output_format,
+                limit=data.get("limit", 100),
+                verified_only=normal_only and not bool(str(status).strip()),
+                email_provider=str(data.get("email_provider") or ""),
+                codex_phone_status=str(data.get("codex_phone_status") or ""),
+                include_claimed=include_claimed,
+                status=status,
+            )
+            payload = _asset_export_zip(results, resource, output_format)
+            lifecycle = (
+                asset_store.archive_asset_results(results, bucket="exported", reason="manual_batch_export")
+                if consume else {"moved_accounts": 0, "moved_files": 0}
+            )
+            return results, payload, lifecycle
+
+        results, payload, lifecycle = await asyncio.to_thread(build_export)
+    except asset_store.AssetError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return JSONResponse({"error": str(exc)[:240]}, status_code=400)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return Response(
+        payload,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="asset-export-{resource}-{stamp}.zip"',
+            "X-Asset-Count": str(len(results)),
+            "X-Asset-Consumed": str(lifecycle.get("moved_accounts", 0)),
+        },
+    )
+
+
+def _asset_scan_payload(progress_only=False):
+    scan = {
         **ASSET_SCAN_STATE,
         "progress": dict(ASSET_SCAN_STATE.get("progress") or {}),
     }
+    if progress_only:
+        return {"scan": scan}
+    from common import asset_scanner
+
+    report = asset_scanner.get_report()
+    report["scan"] = scan
     return report
 
 
@@ -1021,37 +1383,38 @@ def _set_asset_scan_progress(value):
     }
 
 
-def _scan_assets_sync(platforms, concurrency=4, timeout=15, progress=None):
+def _scan_assets_sync(
+    platforms,
+    concurrency=1,
+    account_concurrency=4,
+    timeout=15,
+    progress=None,
+    force=False,
+    include_plus_trial=False,
+):
     from common import asset_scanner
 
     with ASSET_SCAN_LOCK:
         return asset_scanner.scan_pool(
             platforms=platforms,
             concurrency=concurrency,
+            account_concurrency=account_concurrency,
             timeout=timeout,
             progress=progress,
+            force=force,
+            include_plus_trial=include_plus_trial,
         )
 
 
-def _get_verified_asset(platform, callback):
-    """Scan the requested pool immediately before exposing a credential."""
-    from common import asset_store
-
-    normalized = str(platform or "").strip().lower()
-    if normalized not in {"outlook", "chatgpt", "claude", "grok", "kiro"}:
-        raise asset_store.AssetError("platform 仅支持 outlook、chatgpt、claude、grok、kiro")
-    if ASSET_SCAN_STATE["running"]:
-        raise asset_store.AssetUnverified("号池扫描正在运行，请等待扫描结束后再次读取资产")
-    with ASSET_SCAN_LOCK:
-        if ASSET_SCAN_STATE["running"]:
-            raise asset_store.AssetUnverified("号池扫描正在运行，请等待扫描结束后再次读取资产")
-        from common import asset_scanner
-
-        asset_scanner.scan_pool(platforms=[normalized], concurrency=4, timeout=15)
-        return callback(asset_store)
-
-
-async def _run_asset_scan(platforms, concurrency, timeout):
+async def _run_asset_scan(
+    platforms,
+    concurrency,
+    account_concurrency,
+    timeout,
+    force=False,
+    quarantine_bad=True,
+    include_plus_trial=False,
+):
     global ASSET_SCAN_TASK
     from common import asset_scanner
 
@@ -1065,9 +1428,20 @@ async def _run_asset_scan(platforms, concurrency, timeout):
             _scan_assets_sync,
             platforms=platforms,
             concurrency=concurrency,
+            account_concurrency=account_concurrency,
             timeout=timeout,
             progress=progress,
+            force=force,
+            include_plus_trial=include_plus_trial,
         )
+        if quarantine_bad:
+            from common import asset_store
+
+            ASSET_SCAN_STATE["quarantine"] = await asyncio.to_thread(
+                asset_store.quarantine_scan_report, report
+            )
+        else:
+            ASSET_SCAN_STATE["quarantine"] = {"moved_accounts": 0, "moved_files": 0}
         ASSET_SCAN_STATE["finished_at"] = report.get("finished_at", "")
         ASSET_SCAN_STATE["error"] = ""
     except Exception as exc:
@@ -1079,11 +1453,11 @@ async def _run_asset_scan(platforms, concurrency, timeout):
 
 
 @app.get("/api/assets/scan")
-def api_asset_scan_get(request: Request):
+def api_asset_scan_get(request: Request, progress_only: bool = False):
     denied = _asset_api_denied(request)
     if denied:
         return denied
-    return _asset_result(_asset_scan_payload)
+    return _asset_result(lambda: _asset_scan_payload(progress_only=progress_only))
 
 
 @app.post("/api/assets/scan")
@@ -1111,12 +1485,26 @@ async def api_asset_scan_start(request: Request):
     if invalid:
         return JSONResponse({"error": f"不支持的平台：{', '.join(invalid)}"}, status_code=400)
     try:
-        concurrency = min(12, max(1, int((data or {}).get("concurrency") or 4)))
+        platform_limit, account_limit = asset_scanner.scan_concurrency_limits()
+        concurrency = min(platform_limit, max(1, int((data or {}).get("concurrency") or 1)))
+        account_concurrency = min(account_limit, max(1, int((data or {}).get("account_concurrency") or 4)))
         timeout = min(60, max(5, int((data or {}).get("timeout") or 15)))
     except (TypeError, ValueError):
         return JSONResponse({"error": "concurrency 和 timeout 必须是整数"}, status_code=400)
 
-    current = asset_scanner.get_report()
+    # A POST represents an explicit/manual scan. Reuse remains available to
+    # programmatic scanner callers, but the WebUI action must probe accounts.
+    force = (data or {}).get("force", True)
+    if not isinstance(force, bool):
+        return JSONResponse({"error": "force 必须是布尔值"}, status_code=400)
+    quarantine_bad = (data or {}).get("quarantine_bad", True)
+    if not isinstance(quarantine_bad, bool):
+        return JSONResponse({"error": "quarantine_bad 必须是布尔值"}, status_code=400)
+    include_plus_trial = (data or {}).get("include_plus_trial", False)
+    if not isinstance(include_plus_trial, bool):
+        return JSONResponse({"error": "include_plus_trial 必须是布尔值"}, status_code=400)
+
+    current = await asyncio.to_thread(asset_scanner.get_report)
     total = sum(1 for item in current["items"] if item.get("platform") in set(platforms))
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     ASSET_SCAN_STATE.update({
@@ -1125,9 +1513,31 @@ async def api_asset_scan_start(request: Request):
         "finished_at": "",
         "error": "",
         "progress": {"completed": 0, "total": total, "current": ""},
+        "quarantine": {"moved_accounts": 0, "moved_files": 0},
     })
-    ASSET_SCAN_TASK = asyncio.create_task(_run_asset_scan(platforms, concurrency, timeout))
-    return {"ok": True, "platforms": platforms, "scan": dict(ASSET_SCAN_STATE)}
+    ASSET_SCAN_TASK = asyncio.create_task(
+        _run_asset_scan(
+            platforms,
+            concurrency,
+            account_concurrency,
+            timeout,
+            force,
+            quarantine_bad,
+            include_plus_trial,
+        )
+    )
+    return {
+        "ok": True,
+        "platforms": platforms,
+        "safe_mode": {
+            "platform_concurrency": concurrency,
+            "account_concurrency": account_concurrency,
+            "force": force,
+            "quarantine_bad": quarantine_bad,
+            "include_plus_trial": include_plus_trial,
+        },
+        "scan": dict(ASSET_SCAN_STATE),
+    }
 
 
 @app.get("/api/scripts")
@@ -1157,16 +1567,130 @@ async def api_k12_start():
 
 @app.get("/api/chatgpt-plus/status")
 async def api_chatgpt_plus_status():
-    _plus_runtime_environment()
-    status = _plus_status()
-    if not status["alive"] and status["ready"]:
-        status = await asyncio.to_thread(_start_plus_service_sync)
-    return status
+    return _plus_status()
 
 
 @app.post("/api/chatgpt-plus/start")
 async def api_chatgpt_plus_start():
-    return await asyncio.to_thread(_start_plus_service_sync)
+    return _plus_status()
+
+
+@app.post("/api/chatgpt-plus/import-codex")
+async def api_chatgpt_plus_import_codex(request: Request):
+    data = await request.json()
+    account_text = str((data or {}).get("accounts") or "")
+    if not account_text.strip():
+        return JSONResponse({"error": "请粘贴至少一个 Plus 账号"}, status_code=400)
+    if len(account_text) > 5_000_000:
+        return JSONResponse({"error": "批量账号内容超过 5 MB"}, status_code=413)
+
+    from common.account_records import canonical_plus_account_line, parse_account_text
+
+    records, errors = parse_account_text(account_text, plus_credentials=True)
+    if errors:
+        return JSONResponse(
+            {"error": "账号格式错误或存在重复邮箱", "details": errors[:20]},
+            status_code=400,
+        )
+    if not records:
+        return JSONResponse({"error": "没有可导入的账号"}, status_code=400)
+    if len(records) > 100:
+        return JSONResponse({"error": "单批最多导入 100 个账号"}, status_code=400)
+
+    def bounded_int(key, default, minimum, maximum):
+        try:
+            value = int((data or {}).get(key, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} 必须是整数") from exc
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key} 必须在 {minimum}-{maximum} 之间")
+        return value
+
+    try:
+        concurrency = bounded_int("concurrency", 1, 1, 5)
+        phone_attempts = bounded_int("phone_attempts", 3, 1, 10)
+        sms_timeout = bounded_int("sms_timeout", 180, 30, 600)
+        timeout = bounded_int("timeout", 600, 120, 3600)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    sms_provider = str((data or {}).get("sms_provider") or "auto").strip().lower()
+    if sms_provider not in {"auto", "custom", "smsman", "firefox", "hero"}:
+        return JSONResponse({"error": "未知手机号接码平台"}, status_code=400)
+    skip_phone = bool((data or {}).get("skip_phone"))
+    no_import = bool((data or {}).get("no_import"))
+    output_format = str((data or {}).get("output_format") or "none").strip().lower()
+    if output_format not in {"none", "sub2api"}:
+        return JSONResponse({"error": "未知 token 输出格式"}, status_code=400)
+    output_path = str((data or {}).get("output") or "").strip()[:500]
+    if sms_provider == "custom" and not skip_phone:
+        from common import custom_sms
+
+        custom_pool = await asyncio.to_thread(custom_sms.summary)
+        required = min(concurrency, len(records))
+        if custom_pool["available"] < required:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"自定义号码池可用 {custom_pool['available']} 个，"
+                        f"当前并发启动至少需要 {required} 个"
+                    )
+                },
+                status_code=400,
+            )
+    node = str((data or {}).get("node") or "auto").strip()[:120] or "auto"
+    group = str(
+        (data or {}).get("group")
+        or _read_config_val("SUB2API_GROUP", "codex")
+        or "codex"
+    ).strip()[:120]
+
+    data_root = os.path.abspath(os.environ.get("REG_FACTORY_DATA_DIR") or ROOT)
+    runtime_dir = os.path.join(data_root, "runtime", "plus_codex")
+    os.makedirs(runtime_dir, exist_ok=True)
+    descriptor, input_path = tempfile.mkstemp(
+        prefix="accounts-", suffix=".txt", dir=runtime_dir, text=True
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(canonical_plus_account_line(item) for item in records) + "\n")
+        with contextlib.suppress(OSError):
+            os.chmod(input_path, 0o600)
+
+        script = schema.script_by_id("plus_codex_import")
+        args = {
+            "--accounts-file": input_path,
+            "--group": group,
+            "--concurrency": concurrency,
+            "--node": node,
+            "--sms-provider": sms_provider,
+            "--phone-attempts": phone_attempts,
+            "--sms-timeout": sms_timeout,
+            "--timeout": timeout,
+            "--skip-phone": skip_phone,
+            "--no-import": no_import,
+            "--output-format": output_format,
+            "--delete-input": True,
+            "--keep-on-fail": bool((data or {}).get("keep_on_fail")),
+        }
+        if output_path:
+            args["--output"] = output_path
+        task_env = _child_env("chatgpt")
+        from common import proxy_switch
+
+        await asyncio.to_thread(proxy_switch.ensure_proxy_mode, task_env)
+        started = await _start_managed_run(
+            _build_cmd(script, args), "plus_codex_import", task_env, data_root
+        )
+        RUNS[started["run_id"]]["sensitive_input_path"] = input_path
+        return {
+            **started,
+            "accepted": len(records),
+            "accepted_emails": [str(record.get("email") or "").strip().lower() for record in records],
+        }
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(input_path)
+        return JSONResponse({"error": str(exc)[:240]}, status_code=400)
 
 
 def _decode_access_token_claims(token):
@@ -1175,6 +1699,340 @@ def _decode_access_token_claims(token):
         raise ValueError("invalid JWT")
     payload = parts[1] + "=" * (-len(parts[1]) % 4)
     return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+
+
+def _chatgpt_protocol_accounts(emails=None, limit=100):
+    """Load current saved ChatGPT sessions for the protocol-link worker.
+
+    Tokens never leave this process except through the short-lived, local input
+    file consumed by the child worker.  The API only returns redacted counts.
+    """
+    filter_requested = emails is not None
+    requested = {
+        str(value or "").strip().lower()
+        for value in (emails or [])
+        if str(value or "").strip()
+    }
+    data_root = os.environ.get("REG_FACTORY_DATA_DIR", "").strip() or ROOT
+    tokens_dir = os.path.join(data_root, "tokens", "chatgpt")
+    accounts = []
+    seen = set()
+    if os.path.isdir(tokens_dir):
+        for name in os.listdir(tokens_dir):
+            if not name.endswith(".session.json"):
+                continue
+            path = os.path.join(tokens_dir, name)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    session = json.load(handle)
+                token = str(session.get("accessToken") or session.get("access_token") or "").strip()
+                claims = _decode_access_token_claims(token)
+                if float(claims.get("exp") or 0) <= time.time() or token in seen:
+                    continue
+                user = session.get("user") if isinstance(session.get("user"), dict) else {}
+                account = session.get("account") if isinstance(session.get("account"), dict) else {}
+                email = str(user.get("email") or session.get("email") or claims.get("email") or "").strip().lower()
+                if not email or (filter_requested and email not in requested):
+                    continue
+                seen.add(token)
+                accounts.append({
+                    "email": email,
+                    "access_token": token,
+                    "account_id": str(account.get("id") or session.get("account_id") or "").strip(),
+                    "modified_at": os.path.getmtime(path),
+                })
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    accounts.sort(key=lambda item: item["modified_at"], reverse=True)
+    bounded_limit = max(1, min(100, int(limit or 100)))
+    return accounts[:bounded_limit]
+
+
+def _protocol_pool_eligible_emails():
+    """Return cached, redacted pool identities that previously passed trial scan."""
+    from common import asset_scanner
+
+    # Only an explicitly zero-priced offer may enter the protocol pool.
+    allowed = {"zero_price"}
+    report = asset_scanner.get_report()
+    emails = []
+    seen = set()
+    for item in report.get("items", []):
+        if not isinstance(item, dict) or item.get("platform") != "chatgpt":
+            continue
+        email = str(item.get("email") or "").strip().lower()
+        if not email or email in seen or str(item.get("plus_trial") or "") not in allowed:
+            continue
+        seen.add(email)
+        emails.append(email)
+    return emails
+
+
+def _luhn_valid(number):
+    total = 0
+    parity = len(number) % 2
+    for index, character in enumerate(number):
+        digit = int(character)
+        if index % 2 == parity:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def _parse_paypal_payment_details(value):
+    """Normalize optional, per-run PayPal details without persisting raw input."""
+    if value in (None, "", {}):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("payment_details 必须是对象")
+
+    raw_cards = str(value.get("cards") or "").strip()
+    raw_addresses = str(value.get("addresses") or "").strip()
+    raw_phones = str(value.get("phones") or "").strip()
+    if not any((raw_cards, raw_addresses, raw_phones)):
+        return {}
+    if not all((raw_cards, raw_addresses, raw_phones)):
+        raise ValueError("本次支付资料必须同时填写卡片、账单地址和手机号接码")
+
+    def lines(raw, label):
+        values = [line.strip() for line in raw.splitlines() if line.strip()]
+        if not values or len(values) > 100:
+            raise ValueError(f"{label} 必须是 1 到 100 行")
+        return values
+
+    cards = []
+    for line in lines(raw_cards, "卡片"):
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) == 3 and "/" in parts[1]:
+            number, expiry, cvv = parts
+            expiry_parts = [part.strip() for part in expiry.split("/", 1)]
+            if len(expiry_parts) != 2:
+                raise ValueError("卡片格式应为 卡号|MM/YY|CVC")
+            month, year = expiry_parts
+        elif len(parts) == 4:
+            number, month, year, cvv = parts
+        else:
+            raise ValueError("卡片格式应为 卡号|MM/YY|CVC")
+        number = re.sub(r"[ -]", "", number)
+        if not re.fullmatch(r"\d{12,19}", number) or not _luhn_valid(number):
+            raise ValueError("卡号格式或校验位不正确")
+        if not re.fullmatch(r"\d{1,2}", month) or not 1 <= int(month) <= 12:
+            raise ValueError("卡片有效期月份不正确")
+        if not re.fullmatch(r"\d{2}|\d{4}", year):
+            raise ValueError("卡片有效期年份不正确")
+        full_year = 2000 + int(year) if len(year) == 2 else int(year)
+        current = time.localtime()
+        if (full_year, int(month)) < (current.tm_year, current.tm_mon) or full_year > current.tm_year + 20:
+            raise ValueError("卡片已过期或有效期年份超出范围")
+        if not re.fullmatch(r"\d{3,4}", cvv):
+            raise ValueError("CVC 必须是 3 或 4 位数字")
+        cards.append({
+            "number": number,
+            "exp_month": f"{int(month):02d}",
+            "exp_year": str(full_year),
+            "cvv": cvv,
+        })
+
+    addresses = []
+    for line in lines(raw_addresses, "账单地址"):
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) != 4 or not all(parts):
+            raise ValueError("账单地址格式应为 街道|城市|州|邮编")
+        line1, city, state, postal_code = parts
+        if max(map(len, parts)) > 120 or len(state) > 40:
+            raise ValueError("账单地址字段过长")
+        if not re.fullmatch(r"[A-Za-z0-9 -]{3,12}", postal_code):
+            raise ValueError("账单邮编格式不正确")
+        addresses.append({"line1": line1, "city": city, "state": state, "postal_code": postal_code})
+
+    phones = []
+    for line in lines(raw_phones, "手机号接码"):
+        separator = "----" if "----" in line else "|"
+        parts = [part.strip() for part in line.split(separator, 1)]
+        if len(parts) != 2 or not re.fullmatch(r"\+\d{8,15}", parts[0]):
+            raise ValueError("手机号接码格式应为 +国家码手机号----短信记录 URL")
+        parsed_url = urllib.parse.urlsplit(parts[1])
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise ValueError("短信记录 URL 必须是有效的 http(s) 地址")
+        phones.append({"phone": parts[0], "sms_api_url": parts[1]})
+
+    return {
+        "cards": cards,
+        "addresses": addresses,
+        "phone_numbers": phones,
+        "reverse_engineering": True,
+    }
+
+
+def _protocol_batch_script():
+    return {
+        "file": "tools/run_protocol_payment_batch.py",
+        "args": [
+            {"flag": "--accounts-file", "type": "str"},
+            {"flag": "--method", "type": "str"},
+            {"flag": "--operation", "type": "str"},
+            {"flag": "--payment-confirmed", "type": "bool"},
+            {"flag": "--engine-root", "type": "str"},
+            {"flag": "--workers", "type": "int"},
+            {"flag": "--timeout", "type": "int"},
+            {"flag": "--report", "type": "str"},
+            {"flag": "--delete-input", "type": "bool"},
+        ],
+    }
+
+
+@app.get("/api/chatgpt-plus/protocol-status")
+def api_chatgpt_plus_protocol_status():
+    from common.protocol_payment import paypal_payment_ready, protocol_catalog, resolve_protocol_engine_root
+
+    root = resolve_protocol_engine_root()
+    pool_emails = _protocol_pool_eligible_emails()
+    payment_ready = paypal_payment_ready(root or "")
+    return {
+        "ok": True,
+        "engine_ready": bool(root),
+        "account_count": len(_chatgpt_protocol_accounts(limit=100)),
+        "pool_eligible_count": len(_chatgpt_protocol_accounts(pool_emails, limit=100)),
+        "payment_ready": bool(root),
+        "payment_configured": payment_ready,
+        "payment_message": "可使用引擎默认支付资料" if payment_ready else "支付时需录入本次任务资料",
+        "methods": protocol_catalog(root or ""),
+        "message": "协议引擎已就绪" if root else "未找到协议引擎；设置 REG_FACTORY_PROTOCOL_PAYMENT_ROOT 后可用",
+    }
+
+
+@app.post("/api/chatgpt-plus/protocol-batch")
+async def api_chatgpt_plus_protocol_batch(request: Request):
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return JSONResponse({"error": "请求必须是有效的 JSON 对象"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "请求必须是 JSON 对象"}, status_code=400)
+    from common.protocol_payment import payment_method, paypal_payment_ready, resolve_protocol_engine_root
+
+    method = payment_method(data.get("method"))
+    if not method:
+        return JSONResponse({"error": "未知协议渠道"}, status_code=400)
+    if not method["batch_enabled"]:
+        return JSONResponse({"error": f"{method['label']} 的上游协议不支持批量提链"}, status_code=400)
+    engine_root = resolve_protocol_engine_root()
+    if not engine_root:
+        return JSONResponse(
+            {"error": "未找到协议引擎；设置 REG_FACTORY_PROTOCOL_PAYMENT_ROOT 后重试"},
+            status_code=503,
+        )
+    operation = str(data.get("operation") or "extract").strip().lower()
+    if operation not in {"extract", "pay"}:
+        return JSONResponse({"error": "未知协议操作"}, status_code=400)
+    payment_config = {}
+    if operation == "pay":
+        if method["id"] != "paypal":
+            return JSONResponse({"error": "当前只有 PayPal 支持批量协议直接支付；其他渠道需提链后确认"}, status_code=400)
+        if data.get("confirm_payment") is not True:
+            return JSONResponse({"error": "执行真实支付前必须明确勾选支付确认"}, status_code=400)
+        try:
+            payment_config = _parse_paypal_payment_details(data.get("payment_details"))
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if not payment_config and not paypal_payment_ready(engine_root):
+            return JSONResponse({"error": "请录入本次 PayPal 卡片、账单地址和手机号接码资料"}, status_code=400)
+    raw_emails = data.get("emails") or []
+    if not isinstance(raw_emails, list) or len(raw_emails) > 100:
+        return JSONResponse({"error": "emails 必须是最多 100 条的数组"}, status_code=400)
+    source = str(data.get("source") or "saved").strip().lower()
+    if source not in {"saved", "pool"}:
+        return JSONResponse({"error": "未知账号来源"}, status_code=400)
+    try:
+        workers = 1 if operation == "pay" else max(1, min(4, int(data.get("workers") or 1)))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "批量并发必须是整数"}, status_code=400)
+    selected_emails = _protocol_pool_eligible_emails() if source == "pool" else (raw_emails or None)
+    candidates = _chatgpt_protocol_accounts(selected_emails, limit=100)
+    if not candidates:
+        message = "号池中没有已缓存为 Plus 优惠资格且会话可用的账号" if source == "pool" else "没有找到可用的本地 ChatGPT 会话"
+        return JSONResponse({"error": message}, status_code=400)
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def check_one(item):
+        async with semaphore:
+            return item, await asyncio.to_thread(_plus_trial_gate_sync, item)
+
+    checks = await asyncio.gather(*(check_one(item) for item in candidates))
+    # A campaign/discount is not proof of a 0 yuan checkout.
+    allowed = {"zero_price"}
+    eligible = [item for item, result in checks if result.get("plus_trial") in allowed]
+    skipped = [
+        {"email": result.get("email") or item["email"], "reason": result.get("plus_trial") or "unknown"}
+        for item, result in checks
+        if result.get("plus_trial") not in allowed
+    ]
+    if not eligible:
+        return JSONResponse(
+            {"error": "没有命中明确 0 元试用资格的账号，未创建协议任务", "skipped": skipped},
+            status_code=422,
+        )
+
+    data_root = os.path.abspath(os.environ.get("REG_FACTORY_DATA_DIR") or ROOT)
+    runtime_dir = os.path.join(data_root, "runtime", "protocol_payment")
+    os.makedirs(runtime_dir, exist_ok=True)
+    descriptor, input_path = tempfile.mkstemp(prefix="accounts-", suffix=".json", dir=runtime_dir, text=True)
+    report_path = os.path.join(runtime_dir, f"{method['id']}-{int(time.time())}.report.json")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "accounts": [
+                        {"email": item["email"], "access_token": item["access_token"], "account_id": item["account_id"]}
+                        for item in eligible
+                    ],
+                    "payment_config": payment_config,
+                },
+                handle,
+                ensure_ascii=False,
+            )
+        with contextlib.suppress(OSError):
+            os.chmod(input_path, 0o600)
+        task_env = _child_env("chatgpt")
+        runtime_values = _plus_runtime_environment()
+        task_env.update(runtime_values)
+        task_env["REG_FACTORY_PROTOCOL_PAYMENT_ROOT"] = str(engine_root)
+        task_env["REG_FACTORY_PROTOCOL_CHECKOUT_PROXY"] = runtime_values.get("REG_FACTORY_PLUS_LINK_PROXY", "")
+        task_env["REG_FACTORY_PROTOCOL_APPROVE_PROXY"] = runtime_values.get("REG_FACTORY_PLUS_BIND_PROXY", "")
+        from common import proxy_switch
+
+        await asyncio.to_thread(proxy_switch.ensure_proxy_mode, task_env)
+        args = {
+            "--accounts-file": input_path,
+            "--method": method["id"],
+            "--operation": operation,
+            "--payment-confirmed": operation == "pay",
+            "--engine-root": str(engine_root),
+            "--workers": workers,
+            "--timeout": 300,
+            "--report": report_path,
+            "--delete-input": True,
+        }
+        started = await _start_managed_run(
+            _build_cmd(_protocol_batch_script(), args), "plus_protocol_batch", task_env, data_root
+        )
+        RUNS[started["run_id"]]["sensitive_input_path"] = input_path
+        return {
+            **started,
+            "accepted": len(eligible),
+            "skipped": skipped,
+            "payment_method": method["id"],
+            "operation": operation,
+            "source": source,
+            "report": os.path.basename(report_path),
+        }
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(input_path)
+        return JSONResponse({"error": str(exc)[:240]}, status_code=400)
 
 
 def _chatgpt_plus_free_ats(limit=PLUS_BATCH_SIZE):
@@ -1213,19 +2071,106 @@ def _chatgpt_plus_free_ats(limit=PLUS_BATCH_SIZE):
 
 @app.get("/api/chatgpt-plus/export-ats")
 def api_chatgpt_plus_export_ats(limit: int = PLUS_BATCH_SIZE):
-    """Return a bounded batch of current free-account ATs to the local UI."""
-    accounts, available = _chatgpt_plus_free_ats(limit)
-    response = JSONResponse({
-        "ats": [item["access_token"] for item in accounts],
-        "count": len(accounts),
-        "available": available,
-        "batch_size": min(PLUS_BATCH_SIZE, available),
-    })
-    response.headers["Cache-Control"] = "no-store"
-    return response
+    del limit
+    return JSONResponse(
+        {"error": "Plus 提链和绑卡功能已移除，请使用 Codex OAuth 批量导入"},
+        status_code=410,
+    )
 
 
-async def _proxy_local_plus(request: Request, upstream_path: str):
+_PLUS_CHECKOUT_GATE_PATHS = frozenset({
+    "/card-bind/session",
+    "/standalone-flow/preflight",
+    "/standalone-flow/quick-checkout",
+    "/standalone-flow/quick-checkout-batch",
+})
+
+
+def _plus_trial_gate_sync(payload: dict) -> dict:
+    """Return a redacted trial decision for one checkout payload."""
+    token = str(payload.get("access_token") or payload.get("accessToken") or "").strip()
+    email = str(payload.get("email") or "").strip()
+    if not token:
+        return {
+            "email": email,
+            "plus_trial": "unknown",
+            "detail": "missing access token",
+            "evidence": "local:missing_access_token",
+        }
+    try:
+        from common.asset_scanner import _scan_chatgpt_plus_trial
+
+        token_view = {
+            "account_id": str(payload.get("account_id") or "").strip(),
+        }
+        result = _scan_chatgpt_plus_trial(
+            {"platform": "chatgpt", "email": email, "_token": token_view},
+            token,
+            20,
+        )
+        return {
+            "email": email,
+            "plus_trial": str(result.get("plus_trial") or "unknown"),
+            "detail": str(result.get("plus_trial_detail") or ""),
+            "evidence": str(result.get("plus_trial_evidence") or ""),
+        }
+    except Exception as exc:  # keep the gate fail-closed and redact credentials
+        return {
+            "email": email,
+            "plus_trial": "unknown",
+            "detail": f"trial check failed: {type(exc).__name__}",
+            "evidence": "accounts_check:error",
+        }
+
+
+def _plus_gate_items(path: str, payload: dict) -> list[dict]:
+    if path == "/standalone-flow/quick-checkout-batch":
+        source = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
+        return [
+            item.get("payload")
+            for item in source
+            if isinstance(item, dict) and isinstance(item.get("payload"), dict)
+        ]
+    return [payload]
+
+
+async def _plus_trial_gate(path: str, method: str, body: bytes):
+    """Reject Checkout/payment requests unless every account has a Plus offer."""
+    if method.upper() != "POST" or path not in _PLUS_CHECKOUT_GATE_PATHS:
+        return None
+    try:
+        payload = json.loads(body or b"{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "request body must be JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "request body must be an object"}, status_code=400)
+    items = _plus_gate_items(path, payload)
+    if not items:
+        return JSONResponse({"ok": False, "error": "no checkout accounts supplied"}, status_code=400)
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def check_one(item: dict) -> dict:
+        async with semaphore:
+            return await asyncio.to_thread(_plus_trial_gate_sync, item)
+
+    results = await asyncio.gather(*(check_one(item) for item in items))
+    # Fail closed unless the latest read-only check proved a zero price.
+    allowed = {"zero_price"}
+    blocked = [item for item in results if item.get("plus_trial") not in allowed]
+    if blocked:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "提链/支付仅允许明确 0 元试用资格的账号",
+                "accounts": blocked,
+            },
+            status_code=422,
+        )
+    return None
+
+
+async def _proxy_local_plus(request: Request, upstream_path: str, body: bytes | None = None):
     _plus_runtime_environment()
     if not _plus_health():
         await asyncio.to_thread(_start_plus_service_sync)
@@ -1240,7 +2185,8 @@ async def _proxy_local_plus(request: Request, upstream_path: str):
         )
     }
     fwd_headers["Accept-Encoding"] = "identity"
-    body = await request.body()
+    if body is None:
+        body = await request.body()
 
     def _do_proxy():
         req = urllib.request.Request(
@@ -1278,7 +2224,8 @@ async def _proxy_local_plus(request: Request, upstream_path: str):
 
 @app.api_route("/chatgpt-plus/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy_chatgpt_plus_page(request: Request, path: str):
-    return await _proxy_local_plus(request, f"/{path}")
+    upstream_path = "/" + path.lstrip("/") if path else "/"
+    return await _proxy_local_plus(request, upstream_path)
 
 
 @app.api_route(
@@ -1286,7 +2233,12 @@ async def proxy_chatgpt_plus_page(request: Request, path: str):
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 async def proxy_chatgpt_plus_api(request: Request, path: str):
-    return await _proxy_local_plus(request, f"/api/{path}")
+    upstream_path = "/" + path.lstrip("/") if path else "/"
+    body = await request.body() if request.method.upper() == "POST" else b""
+    blocked = await _plus_trial_gate(upstream_path, request.method, body)
+    if blocked is not None:
+        return blocked
+    return await _proxy_local_plus(request, upstream_path, body=body)
 
 
 # ============================================================ 邮箱池批量导入
@@ -1296,31 +2248,16 @@ _EMAIL_RE = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 def _parse_mail_line(line):
-    """把一行拆成 [email, password, token, client_id]。兼容分隔符：----(多横线)/制表符/逗号/竖线/空格。
-    email+密码必填，否则返回 None。"""
-    s = line.strip()
-    if not s or s.startswith("#"):
+    """Parse and normalize a mailbox without accepting token-only records."""
+    from common.account_records import canonical_account_line, parse_account_line
+
+    try:
+        record = parse_account_line(line)
+    except ValueError:
         return None
-    # 统一各种分隔符成 \x00：先处理 2+ 连字符，再 tab/逗号/竖线
-    norm = _re.sub(r"-{2,}", "\x00", s)
-    norm = _re.sub(r"[\t,|]+", "\x00", norm)
-    parts = [p.strip() for p in norm.split("\x00")]
-    # 若没拆出多列(只有空格分隔)，退化用空白拆
-    if len(parts) < 2:
-        parts = [p.strip() for p in s.split() if p.strip()]
-    parts = [p for p in parts if p != ""]
-    if len(parts) < 2:
+    if record.get("source_type") != "mailbox" or not record.get("email"):
         return None
-    email, password = parts[0], parts[1]
-    if not _EMAIL_RE.match(email):
-        return None
-    token = parts[2] if len(parts) >= 3 else ""
-    client_id = parts[3] if len(parts) >= 4 else ""
-    # 去掉尾部空字段，避免写出 "email----pass--------"(多余空列)
-    fields = [email, password, token, client_id]
-    while len(fields) > 2 and fields[-1] == "":
-        fields.pop()
-    return fields
+    return canonical_account_line(record).split("----")
 
 
 def _existing_emails():
@@ -1467,6 +2404,28 @@ def api_sms_rents():
     return {"rents": out, "ttl": SMS_RENT_TTL}
 
 
+@app.get("/api/sms/custom")
+async def api_custom_sms_get():
+    from common import custom_sms
+
+    return await asyncio.to_thread(custom_sms.summary)
+
+
+@app.post("/api/sms/custom")
+async def api_custom_sms_import(request: Request):
+    data = await request.json()
+    text = str((data or {}).get("text") or "")
+    if not text.strip():
+        return JSONResponse({"error": "请粘贴至少一个号码和记录 URL"}, status_code=400)
+    if len(text) > 1_000_000:
+        return JSONResponse({"error": "自定义号码批量内容不能超过 1 MB"}, status_code=413)
+    if len([line for line in text.splitlines() if line.strip()]) > 1000:
+        return JSONResponse({"error": "单批最多导入 1000 个号码"}, status_code=400)
+    from common import custom_sms
+
+    return await asyncio.to_thread(custom_sms.import_text, text)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return open(os.path.join(WEBUI, "static", "index.html"), encoding="utf-8").read()
@@ -1474,7 +2433,7 @@ def index():
 
 @app.post("/api/update")
 def api_update():
-    global UPDATE_PROCESS, UPDATE_LOG_HANDLE
+    global UPDATE_PROCESS, UPDATE_LOG_HANDLE, UPDATE_RESULT_PATH
     status = _update_status()
     if status["status"] == "running":
         return JSONResponse({"ok": False, "error": "更新已经在进行中", "update": status}, status_code=409)
@@ -1496,13 +2455,22 @@ def api_update():
     log_dir = os.path.join(data_root, "runtime")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "update.log")
+    UPDATE_RESULT_PATH = os.path.join(log_dir, "update-result.json")
+    try:
+        os.remove(UPDATE_RESULT_PATH)
+    except FileNotFoundError:
+        pass
     if UPDATE_LOG_HANDLE:
         UPDATE_LOG_HANDLE.close()
     UPDATE_LOG_HANDLE = open(log_path, "a", encoding="utf-8")
-    child_env = os.environ.copy()
-    child_env["REG_FACTORY_NONINTERACTIVE"] = "1"
+    child_env = _update_child_env()
+    command = _update_script(UPDATE_RESULT_PATH)
     process_options = {
-        "cwd": ROOT,
+        "cwd": (
+            os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+            if getattr(sys, "frozen", False)
+            else ROOT
+        ),
         "env": child_env,
         "stdin": subprocess.DEVNULL,
         "stdout": UPDATE_LOG_HANDLE,
@@ -1510,8 +2478,7 @@ def api_update():
     }
     if os.name == "nt":
         process_options["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
     else:
@@ -1540,32 +2507,60 @@ def api_update():
 @app.get("/api/status")
 def api_status():
     provider = _fingerprint_provider()
-    browser_runtime = {}
-    if provider in {"ruyipage", "ruyi", "firefox_bidi"}:
-        try:
-            from common.ruyipage_runtime import runtime_status
-
-            browser_runtime = runtime_status(
-                _read_config_val("RUYIPAGE_BROWSER_PATH", "")
-            )
-            bb = browser_runtime.get("path", "") if browser_runtime.get("state") == "ready" else ""
-        except Exception:
-            bb = ""
-        provider_label = "ruyipage"
-    elif provider in {"bundled", "embedded", "local", "custom", "chrome", "chromium"}:
+    browser_headers = {}
+    browser_verify_tls = True
+    if provider in {"bundled", "embedded", "local", "custom", "chrome", "chromium"}:
         from common.bundled_browser import find_browser_path
 
         bb = find_browser_path()
         provider_label = "custom" if provider in {"custom", "chrome", "chromium"} else "bundled"
+    elif provider in {"cloak", "cloakbrowser"}:
+        provider_label = "cloak"
+        bb = "cloakbrowser"
+    elif provider in {"roxy", "roxybrowser"}:
+        bb = _read_config_val("ROXY_API_BASE", "http://127.0.0.1:50100")
+        provider_label = "roxy"
+        token = _read_config_val("ROXY_API_TOKEN", "").strip()
+        if token:
+            browser_headers = {"token": token, "Authorization": f"Bearer {token}"}
     elif provider in {"adspower", "ads_power", "ads"}:
         bb = _read_config_val("ADSPOWER_API", "http://127.0.0.1:50325")
         provider_label = "adspower"
     elif provider in {"custom_api", "api"}:
         bb = _read_config_val("CUSTOM_BROWSER_API", "")
         provider_label = "custom_api"
+        key = (_read_config_val("CUSTOM_BROWSER_API_KEY", "") or _read_config_val("CUSTOM_BROWSER_API_TOKEN", "")).strip()
+        if key:
+            header = _read_config_val("CUSTOM_BROWSER_API_AUTH_HEADER", "Authorization").strip() or "Authorization"
+            prefix = _read_config_val("CUSTOM_BROWSER_API_AUTH_PREFIX", "Bearer ", allow_empty=True)
+            if prefix.strip().lower() in {"bearer", "token", "basic", "apikey", "api-key"}:
+                prefix = prefix.strip() + " "
+            browser_headers = {header: f"{prefix}{key}"}
+        extra_headers = _read_config_val("CUSTOM_BROWSER_API_HEADERS", "").strip()
+        if extra_headers:
+            try:
+                value = json.loads(extra_headers)
+                if isinstance(value, dict):
+                    browser_headers.update({str(item_key): str(item_value) for item_key, item_value in value.items()})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        browser_verify_tls = _read_config_val("CUSTOM_BROWSER_API_VERIFY_TLS", "true").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
     else:
         bb = _read_config_val("BITBROWSER_API", "http://127.0.0.1:54345")
         provider_label = "bitbrowser"
+    if provider_label == "cloak":
+        try:
+            import importlib.util
+
+            browser_ready = importlib.util.find_spec("cloakbrowser") is not None
+        except Exception:
+            browser_ready = False
+    elif provider_label in {"bundled", "custom"}:
+        browser_ready = os.path.isfile(bb)
+    else:
+        browser_ready = _http_alive(bb, headers=browser_headers, verify_tls=browser_verify_tls)
     mode = "clash_auto"
     proxy = ""
     network = False
@@ -1583,43 +2578,18 @@ def api_status():
         "version": WEBUI_VERSION,
         "root": ROOT,
         "data_root": os.environ.get("REG_FACTORY_DATA_DIR") or ROOT,
-        "bitbrowser": os.path.isfile(bb) if provider_label in {"ruyipage", "bundled", "custom"} else _http_alive(bb),
+        "bitbrowser": browser_ready,
         "browser_provider": provider_label,
-        "browser_runtime": browser_runtime,
         "clash": network,
         "network": network,
         "proxy_mode": mode,
         "direct_proxy": mode == "residential" and bool(proxy),
         "k12": _k12_alive(),
-        "chatgpt_plus": _plus_status()["alive"],
+        "chatgpt_plus": _plus_status()["ready"],
         "node": node,
         "running": sum(1 for r in RUNS.values() if not r["done"]),
         "update": _update_status(),
     }
-
-
-_PROXY_ENV_KEYS = (
-    "PROXY_MODE",
-    "OUTLOOK_PROXY_MODE",
-    "CLAUDE_PROXY_MODE",
-    "CHATGPT_PROXY_MODE",
-    "GROK_PROXY_MODE",
-    "KIRO_PROXY_MODE",
-    "CLASH_API",
-    "CLASH_SECRET",
-    "CLASH_PROXY",
-    "CLASH_GROUP",
-    "CLASH_FIXED_NODE",
-    "REG_FACTORY_PLUS_LINK_ROUTE",
-    "REG_FACTORY_PLUS_BIND_ROUTE",
-    "REG_FACTORY_PLUS_LINK_PROXY_OVERRIDE",
-    "REG_FACTORY_PLUS_BIND_PROXY_OVERRIDE",
-    "REG_FACTORY_PROXY",
-    "REG_FACTORY_PROXY_POOL",
-    "REG_FACTORY_PROXY_ROTATE_URL",
-    "REG_FACTORY_PROXY_ROTATE_METHOD",
-    "CHATGPT_RESIDENTIAL_ROTATE_RETRIES",
-)
 
 
 def _proxy_panel_data(include_nodes=False):
@@ -1633,6 +2603,9 @@ def _proxy_panel_data(include_nodes=False):
     config["CLASH_PROXY"] = config["CLASH_PROXY"] or "http://127.0.0.1:7897"
     config["CLASH_GROUP"] = config["CLASH_GROUP"] or "GLOBAL"
     config["REG_FACTORY_PROXY_ROTATE_METHOD"] = config["REG_FACTORY_PROXY_ROTATE_METHOD"] or "GET"
+    config["REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE"] = config["REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE"] or "balanced"
+    config["REG_FACTORY_MAX_CONCURRENCY"] = config["REG_FACTORY_MAX_CONCURRENCY"] or "10"
+    config["REG_FACTORY_ALLOW_SHARED_EGRESS"] = config["REG_FACTORY_ALLOW_SHARED_EGRESS"] or "false"
     config["CHATGPT_RESIDENTIAL_ROTATE_RETRIES"] = config["CHATGPT_RESIDENTIAL_ROTATE_RETRIES"] or "3"
     config["REG_FACTORY_PROXY_POOL"] = config["REG_FACTORY_PROXY_POOL"].replace(",", "\n")
     nodes = []
@@ -1740,6 +2713,23 @@ async def api_proxy_set(request: Request):
     if method.upper() not in {"GET", "POST"}:
         return JSONResponse({"ok": False, "error": "换 IP 接口方法只能是 GET 或 POST"}, status_code=400)
     updates["REG_FACTORY_PROXY_ROTATE_METHOD"] = method.upper()
+    traffic_mode = updates["REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE"] or "balanced"
+    if traffic_mode not in {"off", "balanced", "aggressive", "extreme"}:
+        return JSONResponse({"ok": False, "error": "住宅流量模式无效"}, status_code=400)
+    updates["REG_FACTORY_RESIDENTIAL_TRAFFIC_MODE"] = traffic_mode
+    try:
+        maximum = int(updates["REG_FACTORY_MAX_CONCURRENCY"] or "10")
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "最大并发数必须是整数"}, status_code=400)
+    if not 1 <= maximum <= 100:
+        return JSONResponse({"ok": False, "error": "最大并发数必须在 1 到 100 之间"}, status_code=400)
+    updates["REG_FACTORY_MAX_CONCURRENCY"] = str(maximum)
+    shared = updates["REG_FACTORY_ALLOW_SHARED_EGRESS"].lower()
+    if shared not in {"", "0", "1", "false", "true", "no", "yes", "off", "on"}:
+        return JSONResponse({"ok": False, "error": "允许共享出口的配置值无效"}, status_code=400)
+    updates["REG_FACTORY_ALLOW_SHARED_EGRESS"] = (
+        "true" if shared in {"1", "true", "yes", "on"} else "false"
+    )
     try:
         updates["CHATGPT_RESIDENTIAL_ROTATE_RETRIES"] = str(max(1, int(updates["CHATGPT_RESIDENTIAL_ROTATE_RETRIES"] or "3")))
     except ValueError:
@@ -1861,6 +2851,7 @@ def api_env_get():
         for it in g["items"]:
             items.append({
                 "key": it["key"],
+                "label": it.get("label", it["key"]),
                 "value": cur.get(it["key"], ""),
                 "required": it.get("required", False),
                 "secret": it.get("secret", False),
@@ -1868,6 +2859,8 @@ def api_env_get():
                 "default": it.get("default", ""),
                 "type": it.get("type", "str"),
                 "choices": it.get("choices", []),
+                "advanced": it.get("advanced", False),
+                "smart": it.get("smart", False),
             })
         groups.append({
             "group": g["group"],
@@ -1938,7 +2931,7 @@ def _child_env(platform: str = ""):
     # Do not leak values loaded from an earlier .env after the active file
     # changes or removes them. Explicit startup values keep precedence.
     for key in managed_keys:
-        if key not in BOOT_ENV:
+        if key not in BOOT_ENV or key in _LIVE_ENV_KEYS:
             if key in saved_env:
                 env[key] = saved_env[key]
             else:
@@ -2079,33 +3072,61 @@ def _terminate_process_tree(pid):
     return not _pid_exists(pid)
 
 
-@app.post("/api/run")
-async def api_run(request: Request):
-    data = await request.json()
-    sid = data.get("script")
-    args = data.get("args") or {}
-    script = schema.script_by_id(sid)
-    if not script:
-        return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=400)
-    selected_platforms = args.get("--platforms") or []
-    plus_requested = bool(args.get("--plus-subscription")) and (
-        sid == "register_chatgpt" or "chatgpt" in selected_platforms
-    )
-    task_env = _child_env(script.get("platform", ""))
-    if plus_requested:
-        task_env.update({
-            key: value
-            for key, value in _plus_runtime_environment().items()
-            if key.startswith("REG_FACTORY_PLUS_") or key == "REG_FACTORY_DATA_DIR"
-        })
+def _cleanup_registered_browser_profiles(owner=None):
+    """Close and remove profiles created by reg-factory child tasks.
+
+    BitBrowser launches Chrome outside the Python process tree, so taskkill on
+    the task PID alone cannot close those windows. The registry contains only
+    profiles created by this project and is safe to process on Stop All.
+    """
     try:
-        from common import proxy_switch
-        await asyncio.to_thread(proxy_switch.ensure_proxy_mode, task_env)
-    except Exception as exc:
-        return JSONResponse({"error": f"网络出口配置未应用: {str(exc)[:160]}"}, status_code=400)
-    cmd = _build_cmd(script, args)
-    task_cwd = os.environ.get("REG_FACTORY_DATA_DIR", "").strip() or ROOT
+        from bitbrowser import BitBrowser
+        from common.browser_registry import active_profiles, unregister
+        records = active_profiles(owner=owner)
+    except Exception:
+        return {"closed": 0, "failed": []}
+    if owner is None:
+        # Global cleanup also adopts generated profiles created by older builds
+        # before the per-run registry was introduced.
+        try:
+            browser = BitBrowser()
+            listed = browser.list_browsers(page=0, page_size=200)
+            known = {str(item.get("id") or "") for item in records}
+            for item in (listed.get("data", {}).get("list") or []):
+                name = str(item.get("name") or "").strip().lower()
+                remark = str(item.get("remark") or "").strip().lower()
+                generated_name = name.startswith((
+                    "outlook_loop_", "chatgpt_", "claude_", "grok_", "kiro_", "github_", "mail_",
+                ))
+                generated_remark = "outlook reg loop" in remark or "reg-factory" in remark
+                if (generated_name or generated_remark) and str(item.get("id") or "") not in known:
+                    records.append({"id": item.get("id"), "api_base": getattr(browser, "api_base", "")})
+        except Exception:
+            pass
+    closed = 0
+    failed = []
+    for record in records:
+        profile_id = str(record.get("id") or "").strip()
+        if not profile_id:
+            continue
+        try:
+            browser = BitBrowser(api_base=record.get("api_base") or None)
+            try:
+                browser.close_browser(profile_id)
+            except Exception:
+                pass
+            browser.delete_browser(profile_id)
+            unregister(profile_id)
+            closed += 1
+        except Exception as exc:
+            failed.append({"id": profile_id, "error": str(exc)[:160]})
+    return {"closed": closed, "failed": failed}
+
+
+async def _start_managed_run(cmd, sid, task_env, task_cwd):
     os.makedirs(task_cwd, exist_ok=True)
+    task_env = dict(task_env)
+    task_env.setdefault("REG_FACTORY_RUN_ID", f"webui-{uuid.uuid4().hex}")
     process_options = (
         {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
         if os.name == "nt"
@@ -2120,13 +3141,30 @@ async def api_run(request: Request):
     run_id = f"r{_run_seq[0]}"
     rec = {"proc": proc, "lines": [], "done": False, "stopped": False,
            "returncode": None, "script": sid,
-           "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S")}
+           "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S"),
+           "run_owner": task_env["REG_FACTORY_RUN_ID"],
+           "keep_on_fail": "--keep-on-fail" in cmd}
     RUNS[run_id] = rec
+
+    def _sanitize_line(value):
+        line = str(value or "")
+        if sid not in {"plus_codex_import", "plus_protocol_batch"}:
+            return line
+        # OTPs and rented numbers must not be copied into the WebUI log stream.
+        line = re.sub(r"\b\d{6}\b", "******", line)
+        line = re.sub(r"(?<!\d)\+(\d{8,15})\b", lambda match: "+***" + match.group(1)[-4:], line)
+        line = re.sub(r"\bM\.[A-Za-z0-9*!._-]{24,}\b", "[redacted-token]", line)
+        line = re.sub(
+            r"(?i)(access[_-]?token|authorization|refresh[_-]?token|card|cvc)([=:])[^\s,}]+",
+            r"\1\2[redacted]",
+            line,
+        )
+        return line
 
     async def _pump():
         try:
             async for raw in proc.stdout:
-                rec["lines"].append(raw.decode("utf-8", "replace").rstrip("\n"))
+                rec["lines"].append(_sanitize_line(raw.decode("utf-8", "replace").rstrip("\n")))
                 if len(rec["lines"]) > 5000:
                     rec["lines"] = rec["lines"][-4000:]
         except Exception as e:
@@ -2134,11 +3172,46 @@ async def api_run(request: Request):
         finally:
             await proc.wait()
             rec["returncode"] = proc.returncode
-            rec["done"] = True
             rec["lines"].append(f"[webui] 进程结束 exit={proc.returncode}")
+            keep_failed_profiles = (
+                rec["keep_on_fail"] and proc.returncode != 0 and not rec["stopped"]
+            )
+            if not keep_failed_profiles:
+                cleanup = await asyncio.to_thread(
+                    _cleanup_registered_browser_profiles, rec["run_owner"]
+                )
+                if cleanup["closed"] or cleanup["failed"]:
+                    rec["lines"].append(
+                        f"[webui] 浏览器环境清理 closed={cleanup['closed']} failed={len(cleanup['failed'])}"
+                    )
+            rec["done"] = True
+            sensitive_input = rec.get("sensitive_input_path")
+            if sensitive_input:
+                with contextlib.suppress(OSError):
+                    os.unlink(sensitive_input)
 
     asyncio.create_task(_pump())
     return {"run_id": run_id, "cmd": rec["cmd"]}
+
+
+@app.post("/api/run")
+async def api_run(request: Request):
+    data = await request.json()
+    sid = data.get("script")
+    args = data.get("args") or {}
+    script = schema.script_by_id(sid)
+    if not script:
+        return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=400)
+    task_env = _child_env(script.get("platform", ""))
+    task_env["REG_FACTORY_RUN_ID"] = f"webui-{uuid.uuid4().hex}"
+    try:
+        from common import proxy_switch
+        await asyncio.to_thread(proxy_switch.ensure_proxy_mode, task_env)
+    except Exception as exc:
+        return JSONResponse({"error": f"网络出口配置未应用: {str(exc)[:160]}"}, status_code=400)
+    cmd = _build_cmd(script, args)
+    task_cwd = os.environ.get("REG_FACTORY_DATA_DIR", "").strip() or ROOT
+    return await _start_managed_run(cmd, sid, task_env, task_cwd)
 
 
 @app.get("/api/logs/{run_id}")
@@ -2184,7 +3257,17 @@ async def api_stop(run_id: str):
     if not rec["done"]:
         rec["stopped"] = True
         stopped = await asyncio.to_thread(_terminate_process_tree, rec["proc"].pid)
-        return {"ok": stopped, "stopped": 1 if stopped else 0}
+        owner = rec.get("run_owner")
+        browser_cleanup = (
+            await asyncio.to_thread(_cleanup_registered_browser_profiles, owner)
+            if owner
+            else {"closed": 0, "failed": []}
+        )
+        return {
+            "ok": stopped and not browser_cleanup["failed"],
+            "stopped": 1 if stopped else 0,
+            "browser_profiles": browser_cleanup,
+        }
     return {"ok": True, "stopped": 0}
 
 
@@ -2215,47 +3298,36 @@ async def api_stop_all():
             stopped += 1
         else:
             failed.append(pid)
+    browser_cleanup = await asyncio.to_thread(_cleanup_registered_browser_profiles)
     return {
         "ok": not failed,
         "stopped": stopped,
         "tracked": len(tracked),
         "orphaned": orphaned,
         "failed": failed,
+        "browser_profiles": browser_cleanup,
     }
 
 
 @app.on_event("startup")
 async def startup_local_services():
-    global K12_START_TASK, RUYIPAGE_INSTALL_TASK
-    if _fingerprint_provider() in {"ruyipage", "ruyi", "firefox_bidi"}:
-        from common.ruyipage_runtime import ensure_runtime, runtime_status
-
-        configured = _read_config_val("RUYIPAGE_BROWSER_PATH", "")
-        if runtime_status(configured).get("state") == "missing":
-            async def install_ruyipage():
-                try:
-                    await asyncio.to_thread(ensure_runtime, configured)
-                except Exception:
-                    pass
-
-            RUYIPAGE_INSTALL_TASK = asyncio.create_task(install_ruyipage())
+    global K12_START_TASK
     auto_start = _read_config_val("K12_AUTO_START", "1").strip().lower() not in {"0", "false", "no", "off"}
     if auto_start and not _k12_alive():
         K12_START_TASK = asyncio.create_task(_start_k12_service())
-    await asyncio.to_thread(_start_plus_service_sync)
 
 
 @app.on_event("shutdown")
 async def shutdown_local_services():
-    global K12_START_TASK, RUYIPAGE_INSTALL_TASK
+    global K12_START_TASK
     if K12_START_TASK and not K12_START_TASK.done():
         K12_START_TASK.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await K12_START_TASK
     K12_START_TASK = None
-    RUYIPAGE_INSTALL_TASK = None
     await _stop_k12_service()
     await asyncio.to_thread(_stop_plus_service_sync)
+    await asyncio.to_thread(_cleanup_registered_browser_profiles)
 
 
 _ensure_proxy_env()
